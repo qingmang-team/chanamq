@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<configuration>
+    <!-- see http://logback.qos.ch/manual/configuration.html#LevelChangePropagator for details -->
+    <contextListener class="ch.qos.logback.classic.jul.LevelChangePropagator">
+        <resetJUL>true</resetJUL>
+    </contextListener>
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy/MM/dd HH:mm:ss}:%p %t %c - %m%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="org.apache" level="WARN" />
+
+    <logger name="kafka.consumer" level="WARN" />
+
+    <logger name="chana" level="DEBUG" />
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT" />
+    </root>
+</configuration>
