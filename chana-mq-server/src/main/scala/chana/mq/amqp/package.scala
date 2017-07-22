@@ -2,14 +2,9 @@ package chana.mq
 
 import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.model.BasicProperties
-import java.time.ZoneId
 import java.util.concurrent.ThreadLocalRandom
 
-/**
- * @author Caoyuan Deng
- */
 package object amqp {
-  val zoneId = ZoneId.of("Asia/Shanghai")
 
   def nextRandomInt(max: Int) = ThreadLocalRandom.current.nextInt(max + 1)
   def nextRandomInt(min: Int, max: Int) = min + ThreadLocalRandom.current.nextInt(max - min + 1)

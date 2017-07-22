@@ -98,11 +98,6 @@ object ExchangeEntity {
 
   def isDefaultExchange(exchange: String) =
     exchange == null || exchange == ""
-
-  def messagIdGenerator() = {
-    System.currentTimeMillis << 22
-  }
-
 }
 /**
  * Durability and related matters: http://rubybunny.info/articles/durability.html
@@ -351,7 +346,7 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
   }
 
   /**
-   * return should kill self or not
+   * @return should kill self or not
    */
   private def queueUnbind(queue: String, routingKey: String): Future[Boolean] = {
     val bindsToRemove = binds.filter { bind => bind.queue == queue && bind.routingKey == routingKey }

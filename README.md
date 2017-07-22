@@ -22,7 +22,11 @@
 
 ## Installation
 
- * To enable persistent feature, you need to install Cassandra first, and create chanamq space and tables as [create-cassantra.cql](https://github.com/qingmang-team/chanamq/blob/master/chana-mq-server/src/main/resources/create-cassantra.cql)
+ * unzip chana-mq-server/target/universal/chana-mq-server-x.x.x.zip; 
+ * cd conf; cp prod.conf application.conf
+ * edit application.conf for your configuration
+ * cd bin; ./chana-mq-server &
+ * To enable persistent feature, you need to install Cassandra and create chanamq space and tables as [create-cassantra.cql](https://github.com/qingmang-team/chanamq/blob/master/chana-mq-server/src/main/resources/create-cassantra.cql)
 
 ## License
 

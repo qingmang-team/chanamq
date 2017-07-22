@@ -50,11 +50,11 @@ object AMQPServer {
 
     /**
      *
-     *          +------------+  +--------------+
-     * tcpIn   ->            |  |              -> tcpOut
-     *          |  merge     -> | frameHandler |
-     * control ->            |  |              |
-     *          +------------|  +--------------+
+     *                      +------------+  +--------------+
+     * tcpIn  -> tcpStage  ->            |  |              -> tcpOut
+     *                      |  merge     -> | frameHandler |
+     *             control ->            |  |              |
+     *                      +------------|  +--------------+
      *
      */
     def serverLogic()(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] =
@@ -64,7 +64,7 @@ object AMQPServer {
         val control = builder.add(Source.tick(0.seconds, 1.micros, Frame.TICK_FRAME_BODY).buffer(1, OverflowStrategy.dropNew))
         val tcpIncoming = builder.add(Flow[ByteString])
         val tcpStage = builder.add(new TcpStage())
-        val frameStage = builder.add(FrameStage.createStage())
+        val frameStage = builder.add(new FrameStage())
 
         val merge = builder.add(MergePreferred[ByteString](1))
         tcpIncoming ~> tcpStage ~> merge.preferred
