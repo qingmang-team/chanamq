@@ -271,78 +271,83 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         val data = grab(in)
         val frames = frameParser.onReceive(data.iterator).iterator
 
-        var publishCommands = Vector[AMQCommand[Basic.Publish]]()
-        var ackCommands = Vector[AMQCommand[Basic.Ack]]()
-        var otherCommands = Vector[AMQCommand[AMQMethod]]()
-        var lastCommandOnThisPush: Option[AMQCommand[AMQMethod]] = None
+        if (frames.hasNext) { // non empty
+          var publishCommands = Vector[AMQCommand[Basic.Publish]]()
+          var ackCommands = Vector[AMQCommand[Basic.Ack]]()
+          var otherCommands = Vector[AMQCommand[AMQMethod]]()
+          var lastCommandOnThisPush: Option[AMQCommand[AMQMethod]] = None
 
-        var shouldClose = false
-        while (frames.hasNext && !shouldClose) {
-          frames.next() match {
-            case FrameParser.Ok(Frame(Frame.TICK, _, _)) =>
+          var shouldClose = false
+          while (frames.hasNext && !shouldClose) {
+            frames.next() match {
+              case FrameParser.Ok(Frame(Frame.TICK, _, _)) =>
 
-            case FrameParser.Ok(Frame(Frame.DISCONNECT, _, _)) =>
-              log.info(s"$id Tcp upstream finished, going to close all channels")
-              completeAndCloseAllChannels()
-              completeStage()
-              shouldClose = true
+              case FrameParser.Ok(Frame(Frame.DISCONNECT, _, _)) =>
+                log.info(s"$id Tcp upstream finished, going to close all channels")
+                completeAndCloseAllChannels()
+                completeStage()
+                shouldClose = true
 
-            case FrameParser.Ok(Frame(Frame.HEARTBEAT, _, _)) =>
-              // TODO check/count heartbeat of this connection? or just let client to deal with it?
-              log.info(s"$id received heartbeat")
+              case FrameParser.Ok(Frame(Frame.HEARTBEAT, _, _)) =>
+                // TODO check/count heartbeat of this connection? or just let client to deal with it?
+                log.info(s"$id received heartbeat")
 
-            case FrameParser.Ok(frame) =>
-              log.debug(s"$id got frame: $frame")
+              case FrameParser.Ok(frame) =>
+                log.debug(s"$id got frame: $frame")
 
-              commandAssembler.onReceive(frame) match {
-                case CommandAssembler.Ok(command) =>
-                  command.method match {
-                    case _: Basic.Ack     => ackCommands :+= command.asInstanceOf[AMQCommand[Basic.Ack]]
-                    case _: Basic.Publish => publishCommands :+= command.asInstanceOf[AMQCommand[Basic.Publish]]
-                    case _                => otherCommands :+= command
-                  }
+                commandAssembler.onReceive(frame) match {
+                  case CommandAssembler.Ok(command) =>
+                    command.method match {
+                      case _: Basic.Ack     => ackCommands :+= command.asInstanceOf[AMQCommand[Basic.Ack]]
+                      case _: Basic.Publish => publishCommands :+= command.asInstanceOf[AMQCommand[Basic.Publish]]
+                      case _                => otherCommands :+= command
+                    }
 
-                  lastCommandOnThisPush = Some(command)
+                    lastCommandOnThisPush = Some(command)
 
-                  // reset for next command
-                  commandAssembler = new CommandAssembler()
-                case error @ CommandAssembler.Error(frame, reason) =>
-                  pushConnectionClose(frame.channel, ErrorCodes.FRAME_ERROR, reason, 0, 0)
-                  log.error(error.toString)
-                  shouldClose = true
+                    // reset for next command
+                    commandAssembler = new CommandAssembler()
+                  case error @ CommandAssembler.Error(frame, reason) =>
+                    pushConnectionClose(frame.channel, ErrorCodes.FRAME_ERROR, reason, 0, 0)
+                    log.error(error.toString)
+                    shouldClose = true
 
-                case _ => // Go on - wait for next frame
-              }
+                  case _ => // Go on - wait for next frame
+                }
 
-            case error @ FrameParser.Error(errorCode, message) =>
-              pushConnectionClose(0, errorCode, message, 0, 0)
-              log.error(error.toString)
-              shouldClose = true
+              case error @ FrameParser.Error(errorCode, message) =>
+                pushConnectionClose(0, errorCode, message, 0, 0)
+                log.error(s"$id S{error.toString}")
+                shouldClose = true
+            }
+          } // end frames loop
+
+          if (!shouldClose) {
+            lastCommandOnThisPush match {
+              case None =>
+                pushHeatbeatOrMessagesOrPull()
+
+              case Some(last) =>
+                if (otherCommands.length > 1) {
+                  log.warning(s"$id Got batch other commands: $otherCommands")
+                }
+                receivedCommands(otherCommands, last)
+
+                if (publishCommands.nonEmpty) {
+                  log.debug(s"$id got publish commands: ${publishCommands.size}")
+                  receivedPublishes(publishCommands, isLastCommand = last.method.isInstanceOf[Basic.Publish])
+                }
+
+                if (ackCommands.nonEmpty) {
+                  log.debug(s"$id got ack commands: ${ackCommands.size}")
+                  receivedAcks(ackCommands, isLastCommand = last.method.isInstanceOf[Basic.Ack])
+                }
+            }
           }
-        }
 
-        if (!shouldClose) {
-          lastCommandOnThisPush match {
-            case None =>
-              pushHeatbeatOrMessagesOrPull()
-
-            case Some(last) =>
-              if (otherCommands.length > 1) {
-                log.warning(s"$id Got batch other commands: $otherCommands")
-              }
-              receivedCommands(otherCommands, last)
-
-              if (publishCommands.nonEmpty) {
-                log.debug(s"$id got publish commands: ${publishCommands.size}")
-                receivedPublishes(publishCommands, isLastCommand = last.method.isInstanceOf[Basic.Publish])
-              }
-
-              if (ackCommands.nonEmpty) {
-                log.debug(s"$id got ack commands: ${ackCommands.size}")
-                receivedAcks(ackCommands, isLastCommand = last.method.isInstanceOf[Basic.Ack])
-              }
-          }
-        }
+        } else {
+          pull(in)
+        } // end frames.hasNext
       }
 
       private def pushHeatbeatOrMessagesOrPull() = {

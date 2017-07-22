@@ -16,9 +16,9 @@ object FrameParser {
    */
   sealed trait State { def nBytes: Int }
 
+  case object ExpectEnd extends State { def nBytes = 1 }
   case object ExpectHeader extends State { def nBytes = 7 }
   final case class ExpectData(nBytes: Int) extends State
-  case object ExpectEnd extends State { def nBytes = 1 }
 
   sealed trait ParseResult extends State
   final case class Ok(frame: Frame) extends ParseResult { def nBytes = 0 }
@@ -70,39 +70,35 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
   private var tpe: Byte = _
   private var channel: Int = _
   private var size: Int = _
-  private var payload: Array[Byte] = _
 
-  // state that may need to reset before next frame
   private var state: State = ExpectHeader
   private var input: ByteIterator = ByteString.empty.iterator
+  private val payload = ByteString.newBuilder
 
   def onReceive(newInput: ByteIterator): Vector[ParseResult] = {
     input = concat(input, newInput)
-    process(Vector.empty)
+    process(Vector())
   }
 
   /**
-   * Loopable method, emit may be called mutilple when input contans more than one frame
+   * Loopable method
    */
   @tailrec
   private def process(acc: Vector[ParseResult]): Vector[ParseResult] = {
-    // has enough data? if false, wait for more input
-    if (input.len < state.nBytes) {
-      return acc
-    }
-
-    // parse and see if we've finished a frame, emit and reset state if true
-    // @Note must change state before the 'emit', because we are not sure about
-    // what's will happen during emit(x), for instance, the emit might
-    // call 'process()' func recursively.
+    //println(s"before: $state, ${input.len}, $acc")
+    // parse and see if we've finished a frame, add to acc and reset state if true
+    val oldLen = input.len
     val acc1 = parse(input, state) match {
-      case x: Error => // with error, should drop remaining input
+      case x: Error =>
+        // when error, we'll drop remaining input
         input = ByteString.empty.iterator
         state = ExpectHeader
+        payload.clear
         acc :+ x
 
       case x: Ok =>
         state = ExpectHeader
+        payload.clear
         acc :+ x
 
       case x =>
@@ -110,8 +106,10 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
         acc
     }
 
+    //println(s"after: $state, ${input.len}, $acc1")
+
     // has more data? go on if true, else wait for more input
-    if (input.hasNext) {
+    if (input.hasNext && input.len != oldLen) {
       process(acc1)
     } else {
       acc1
@@ -120,28 +118,45 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
 
   private def parse(input: ByteIterator, state: State): State = state match {
     case ExpectHeader =>
-      tpe = input.next()
-      channel = readUnsignedShort(input)
-      size = readInt(input)
-
-      if (size > messageSizeLimit) {
-        Error(ErrorCodes.MESSAGE_TOO_LARGE, s"Massage $size large than $messageSizeLimit")
+      if (input.len < ExpectHeader.nBytes) {
+        ExpectHeader
       } else {
-        ExpectData(size)
+        tpe = input.next()
+        channel = readUnsignedShort(input)
+        size = readInt(input)
+
+        if (size > messageSizeLimit) {
+          Error(ErrorCodes.MESSAGE_TOO_LARGE, s"Massage $size large than $messageSizeLimit")
+        } else if (size == 0) {
+          ExpectEnd
+        } else {
+          ExpectData(size)
+        }
       }
 
     case ExpectData(n) =>
-      payload = Array.ofDim[Byte](n)
-      input.getBytes(payload)
+      val len = input.len
 
-      ExpectEnd
+      val bs = Array.ofDim[Byte](math.min(len, n))
+      input.getBytes(bs)
+      payload ++= bs
+
+      if (len < n) {
+        ExpectData(n - len)
+      } else {
+        ExpectEnd
+      }
 
     case ExpectEnd =>
-      readUnsignedByte(input) match {
-        case Frame.FRAME_END =>
-          Ok(Frame(tpe, channel, payload))
-        case x =>
-          Error(ErrorCodes.FRAME_ERROR, s"Bad frame end marker: $x")
+      if (input.len < ExpectEnd.nBytes) {
+        ExpectEnd
+      } else {
+        readUnsignedByte(input) match {
+          case Frame.FRAME_END =>
+            Ok(Frame(tpe, channel, payload.result.toArray))
+          case x =>
+            Error(ErrorCodes.FRAME_ERROR, s"Bad frame end marker: $x")
+        }
       }
 
     case x => x
