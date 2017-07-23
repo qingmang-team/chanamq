@@ -85,7 +85,6 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
    */
   @tailrec
   private def process(acc: Vector[ParseResult]): Vector[ParseResult] = {
-    //println(s"before: $state, ${input.len}, $acc")
     // parse and see if we've finished a frame, add to acc and reset state if true
     val oldLen = input.len
     val acc1 = parse(input, state) match {
@@ -105,8 +104,6 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
         state = x
         acc
     }
-
-    //println(s"after: $state, ${input.len}, $acc1")
 
     // has more data? go on if true, else wait for more input
     if (input.hasNext && input.len != oldLen) {
