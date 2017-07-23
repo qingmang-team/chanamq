@@ -128,14 +128,16 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   // --- msg
 
-  val insertMsgStmt = session.prepare("INSERT INTO msgs (id, tstamp, header, body, exchange, routing) VALUES (?, ?, ?, ?, ?, ?);")
-  val insertMsgTtlStmt = session.prepare("INSERT INTO msgs (id, tstamp, header, body, exchange, routing) VALUES (?, ?, ?, ?, ?, ?) USING TTL ?;")
-  val selectMsgStmt = session.prepare("SELECT id, tstamp, header, body, exchange, routing, TTL(exchange) FROM msgs WHERE id = ? ORDER BY tstamp DESC;")
+  val insertMsgStmt = session.prepare("INSERT INTO msgs (id, tstamp, header, body, exchange, routing, durable, refer) VALUES (?, ?, ?, ?, ?, ?, ?, ?);")
+  val insertMsgTtlStmt = session.prepare("INSERT INTO msgs (id, tstamp, header, body, exchange, routing, durable, refer) VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?;")
+  val updateMsgReferCountStmt = session.prepare("INSERT INTO msgs (id, refer) VALUES (?, ?);")
+  val selectMsgStmt = session.prepare("SELECT id, tstamp, header, body, exchange, routing, durable, refer, TTL(exchange) FROM msgs WHERE id = ?;")
   val deleteMsgStmt = session.prepare("DELETE FROM msgs WHERE id = ?;")
 
   private def _selectMsg(id: Long) = selectMsgStmt.bind(id.asInstanceOf[AnyRef])
+  private def _updateMsgReferCount(id: Long, referCount: Int) = updateMsgReferCountStmt.bind(id.asInstanceOf[AnyRef], referCount.asInstanceOf[AnyRef])
   private def _deleteMsg(id: Long) = deleteMsgStmt.bind(id.asInstanceOf[AnyRef])
-  private def _insertMsg(id: Long, timestamp: Long, header: Option[ByteBuffer], body: Option[ByteBuffer], exchange: String, routing: String, ttl: Option[Long]) = {
+  private def _insertMsg(id: Long, timestamp: Long, header: Option[ByteBuffer], body: Option[ByteBuffer], exchange: String, routing: String, isDurable: Boolean, referCount: Int, ttl: Option[Long]) = {
     val bs = if (ttl.isDefined) {
       new BoundStatement(insertMsgTtlStmt)
     } else {
@@ -148,9 +150,11 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     body foreach { x => bs.setBytes(3, x) }
     bs.setString(4, exchange)
     bs.setString(5, routing)
+    bs.setBool(6, isDurable)
+    bs.setInt(7, referCount)
 
     ttl foreach { x =>
-      bs.setInt(6, (x / 1000.0).toInt)
+      bs.setInt(8, (x / 1000.0).toInt)
     }
 
     bs
@@ -332,7 +336,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   // --- public APIs
 
-  def insertMessage(id: Long, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routing: String, ttl: Option[Long]): Future[Unit] = {
+  def insertMessage(id: Long, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routing: String, isDurable: Boolean, referCount: Int, ttl: Option[Long]): Future[Unit] = {
     val start = System.currentTimeMillis
 
     val headerBytes = header map { x =>
@@ -350,7 +354,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
       }
     } getOrElse (0L)
 
-    execute(_insertMsg(id, timestamp, headerBytes, body map ByteBuffer.wrap, exchange, routing, ttl)) map (_ => ()) andThen {
+    execute(_insertMsg(id, timestamp, headerBytes, body map ByteBuffer.wrap, exchange, routing, isDurable, referCount, ttl)) map (_ => ()) andThen {
       case Success(_) =>
         log.info(s"Inserted Msg of $id in ${System.currentTimeMillis - start}ms")
       case Failure(ex) =>
@@ -358,7 +362,18 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     }
   }
 
-  def selectMessage(id: Long) = {
+  def updateMessageReferCount(id: Long, referCount: Int): Future[Unit] = {
+    val start = System.currentTimeMillis
+
+    execute(_updateMsgReferCount(id, referCount)) map (_ => ()) andThen {
+      case Success(_) =>
+        log.info(s"Updated Msg referCount of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(ex) =>
+        log.error(ex, s"Failed to update msg referCount of $id")
+    }
+  }
+
+  def selectMessage(id: Long): Future[Option[(Message, Boolean, Int)]] = {
     val start = System.currentTimeMillis
     execute(_selectMsg(id)) map { rs =>
       val raws = rs.iterator
@@ -369,8 +384,10 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
         val body = Option(raw.getBytes("body")) map (bytes => Bytes.getArray(bytes))
         val exchange = raw.getString("exchange")
         val routing = raw.getString("routing")
+        val isDurable = raw.getBool("durable")
+        val referCount = raw.getInt("refer")
         val ttl = if (raw.isNull("TTL(exchange)")) None else Some(raw.getInt("TTL(exchange)") * 1000L)
-        Some(Message(id, header, body, exchange, routing, ttl))
+        Some((Message(id, header, body, exchange, routing, ttl), isDurable, referCount))
       } else {
         None
       }

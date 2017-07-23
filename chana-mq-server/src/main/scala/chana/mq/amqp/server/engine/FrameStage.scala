@@ -389,7 +389,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           val callback = getAsyncCallback[mutable.Set[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { setOfChannelConsumerMsgs =>
             val body = setOfChannelConsumerMsgs.foldLeft(ByteString.newBuilder) {
               case (acc, (consumer @ AMQConsumer(channel, consumerTag, queue, autoAck), msgIds, msgs)) =>
-                log.info(s"$id delivered msgs: ${msgs.size}")
+                log.debug(s"$id delivered msgs: ${msgs.size}")
                 if (autoAck) {
                   // Unrefer should happen after message got. Unrefer could be async
                   msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
@@ -431,7 +431,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       }
 
       private def receivedPublishes(publishes: Vector[AMQCommand[Basic.Publish]], isLastCommand: Boolean) {
-        log.info(s"$id published msgs: ${publishes.size}")
+        log.debug(s"$id published msgs: ${publishes.size}")
 
         // Section 4.7 of the AMQP 0-9-1 core specification explains the 
         // conditions under which ordering is guaranteed: messages published

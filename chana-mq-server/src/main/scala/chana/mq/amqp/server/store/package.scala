@@ -11,8 +11,9 @@ package object store {
   case object Done
 
   trait DBOpService extends {
-    def insertMessage(id: Long, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routing: String, ttl: Option[Long]): Future[Unit]
-    def selectMessage(id: Long): Future[Option[Message]]
+    def insertMessage(id: Long, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routing: String, isDurabale: Boolean, referCount: Int, ttl: Option[Long]): Future[Unit]
+    def updateMessageReferCount(id: Long, referCount: Int): Future[Unit]
+    def selectMessage(id: Long): Future[Option[(Message, Boolean, Int)]]
     def deleteMessage(id: Long): Future[Unit]
 
     def insertQueueMeta(id: String, lastConsumed: Long, consumerCount: Int, isDurable: Boolean, queueMsgTtl: Option[Long]): Future[Unit]

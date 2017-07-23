@@ -69,18 +69,21 @@ final class MessageEntity extends Actor with ActorLogging {
   def storeService = serviceBoard.storeService
 
   private var message: Message = _
+  private var isDurable = false
 
   private var referCount = 0
   private var isSavingOrSaved = false
 
   private var lastActiveTime = LocalDateTime.now()
-  private var activeCheckTask: Option[Cancellable] = Some(context.system.scheduler.schedule(5.minute, 5.minute, self, ActiveCheckTick))
+  private var activeCheckTasks: List[Cancellable] = Nil
 
   private val loading = Promise[Unit]
   private lazy val load: Future[Unit] = {
     storeService.selectMessage(longId) map {
-      case Some(msg) =>
+      case Some((msg, isDurable, referCount)) =>
         this.message = msg
+        this.isDurable = isDurable
+        this.referCount = referCount
         this.isSavingOrSaved = true
         setTTL(msg.ttl)
 
@@ -97,10 +100,10 @@ final class MessageEntity extends Actor with ActorLogging {
     loading.future
   }
 
-  private def longId = self.path.name.toLong
+  private lazy val longId = self.path.name.toLong
 
   override def postStop() {
-    activeCheckTask.foreach(_.cancel)
+    activeCheckTasks.foreach(_.cancel)
     log.info(s"$longId stopped")
     super.postStop()
   }
@@ -132,12 +135,13 @@ final class MessageEntity extends Actor with ActorLogging {
       val commander = sender()
       lastActiveTime = LocalDateTime.now()
 
-      referCount += count
+      this.isDurable = isDurable
+      this.referCount += count
       log.debug(s"referCount after Referred $referCount")
 
       val persist = if (isDurable && !isSavingOrSaved && message != null) {
         isSavingOrSaved = true
-        storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, message.ttl)
+        storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, isDurable, referCount, message.ttl)
       } else {
         Future.successful(())
       }
@@ -151,23 +155,42 @@ final class MessageEntity extends Actor with ActorLogging {
       log.debug(s"referCount after queue pull $referCount")
 
       if (referCount <= 0) {
+        if (isSavingOrSaved) {
+          storeService.deleteMessage(longId)
+        }
         self ! PoisonPill
+      } else {
+        if (isDurable) {
+          storeService.updateMessageReferCount(longId, referCount)
+        }
       }
 
     case Expired =>
+      if (isSavingOrSaved) {
+        storeService.deleteMessage(longId)
+      }
       self ! PoisonPill
 
     case ActiveCheckTick =>
       if (LocalDateTime.now().minusSeconds(inactiveInterval).isAfter(lastActiveTime)) {
-        self ! PoisonPill
+        val persist = if (!isSavingOrSaved && message != null) {
+          isSavingOrSaved = true
+          storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, isDurable, referCount, message.ttl)
+        } else {
+          Future.successful(())
+        }
+
+        persist map { _ =>
+          self ! PoisonPill
+        }
       }
   }
 
   private def setTTL(ttl: Option[Long]) {
     log.debug(s"ttl: $ttl")
-    activeCheckTask = ttl match {
-      case Some(x) => Some(context.system.scheduler.scheduleOnce(x.millis, self, Expired))
-      case None    => Some(context.system.scheduler.schedule(5.minutes, 5.minutes, self, ActiveCheckTick))
+    activeCheckTasks = ttl match {
+      case Some(x) => List(context.system.scheduler.schedule(5.minutes, 5.minutes, self, ActiveCheckTick), context.system.scheduler.scheduleOnce(x.millis, self, Expired))
+      case None    => List(context.system.scheduler.schedule(5.minutes, 5.minutes, self, ActiveCheckTick))
     }
   }
 

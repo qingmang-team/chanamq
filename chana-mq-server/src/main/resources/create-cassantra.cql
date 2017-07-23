@@ -11,9 +11,11 @@ CREATE TABLE IF NOT EXISTS msgs (
   body blob,
   exchange text,
   routing text,
+  durable boolean,
+  refer int, -- refer count
 
-  PRIMARY KEY (id, tstamp)
-) WITH CLUSTERING ORDER BY (tstamp DESC);
+  PRIMARY KEY (id)
+);
 
 CREATE TABLE IF NOT EXISTS queues (
   id text, -- queue id/name
