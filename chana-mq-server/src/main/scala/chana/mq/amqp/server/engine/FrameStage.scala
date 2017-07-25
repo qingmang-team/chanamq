@@ -48,7 +48,7 @@ import scala.concurrent.duration._
 import scala.util.Failure
 import scala.util.Success
 
-final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowShape[ByteString, ByteString]] {
+final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowShape[Either[Control, ByteString], ByteString]] {
   type AMQMethod = AMQClass#Method
 
   import system.dispatcher
@@ -75,10 +75,10 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
   private var virtualHost: VirtualHost = _
   private val channels = mutable.Map[Int, AMQChannel]()
 
-  val in = Inlet[ByteString]("tcp-in")
+  val in = Inlet[Either[Control, ByteString]]("tcp-in")
   val out = Outlet[ByteString]("tcp-out")
 
-  override val shape = new FlowShape[ByteString, ByteString](in, out)
+  override val shape = new FlowShape[Either[Control, ByteString], ByteString](in, out)
 
   private val id = System.identityHashCode(FrameStage.this)
 
@@ -167,7 +167,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
     private class HandshakeOutHandler extends OutHandler {
 
       override def onPull() {
-        //log.info(s"$id outport: onPull ==>")
+        log.debug(s"$id outport: onPull ==>")
         pull(in)
       }
     }
@@ -180,54 +180,57 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       }
 
       override def onPush() {
-        //log.info(s"$id ==> inport: onPush")
-        stash ++= grab(in)
-        log.debug(s"stash: $stash")
-        if (stash.length >= AMQP.LENGTH_OF_PROTOCAL_HEADER) {
-          val (header, rest) = stash.splitAt(AMQP.LENGTH_OF_PROTOCAL_HEADER)
-          header.toArray match {
-            case Array(Frame.TICK, 0, 0, 0, 0, 0, 0, -50) =>
-              // ignore it
+        log.debug(s"$id ==> inport: onPush")
+
+        grab(in) match {
+          case Left(Disconnect) =>
+            completeStage()
+
+          case Left(Tick) =>
+            pull(in)
+
+          case Right(bytes) =>
+            stash ++= bytes
+            log.debug(s"stash: $stash")
+            if (stash.length >= AMQP.LENGTH_OF_PROTOCAL_HEADER) {
+              val (header, rest) = stash.splitAt(AMQP.LENGTH_OF_PROTOCAL_HEADER)
+              header.toArray match {
+                case Array('A', 'M', 'Q', 'P', 0, 0, 9, 1) =>
+                  log.info("recv: AMQ protocol header")
+
+                  val serverProperties = Map(
+                    "product" -> "chana.mq",
+                    "version" -> "0.1.0",
+                    "chana.mq.build" -> "1"
+                  )
+
+                  val mechanisms = LongString("PLAIN".getBytes)
+                  val locales = LongString("en_US".getBytes)
+
+                  val method = Connection.Start(
+                    ProtocolVersion.V_0_91.majorVersion,
+                    ProtocolVersion.V_0_91.actualMinorVersion,
+                    serverProperties,
+                    mechanisms,
+                    locales
+                  )
+
+                  val command = AMQCommand(method)
+                  val resp = channel0.render(command)
+
+                  push(out, resp)
+
+                  setHandler(in, new FrameInHandler)
+                  setHandler(out, new FrameOutHandler)
+
+                case _ =>
+                  log.warning(s"recv: $stash")
+                  push(out, ByteString(ProtocolVersion.V_0_91.protocolHeader))
+              }
+              stash = rest
+            } else {
               pull(in)
-
-            case Array(Frame.DISCONNECT, 0, 0, 0, 0, 0, 0, -50) =>
-              completeStage()
-
-            case Array('A', 'M', 'Q', 'P', 0, 0, 9, 1) =>
-              log.info("recv: AMQ protocol header")
-
-              val serverProperties = Map(
-                "product" -> "chana.mq",
-                "version" -> "0.1.0",
-                "chana.mq.build" -> "1"
-              )
-
-              val mechanisms = LongString("PLAIN".getBytes)
-              val locales = LongString("en_US".getBytes)
-
-              val method = Connection.Start(
-                ProtocolVersion.V_0_91.majorVersion,
-                ProtocolVersion.V_0_91.actualMinorVersion,
-                serverProperties,
-                mechanisms,
-                locales
-              )
-
-              val command = AMQCommand(method)
-              val resp = channel0.render(command)
-
-              push(out, resp)
-
-              setHandler(in, new FrameInHandler)
-              setHandler(out, new FrameOutHandler)
-
-            case _ =>
-              log.warning(s"recv: $stash")
-              push(out, ByteString(ProtocolVersion.V_0_91.protocolHeader))
-          }
-          stash = rest
-        } else {
-          pull(in)
+            }
         }
       }
     }
@@ -239,7 +242,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
        * push(out, elem) is now allowed to be called on this port.
        */
       override def onPull() {
-        //log.info(s"$id outport: onPull ==>")
+        log.debug(s"$id outport: onPull ==>")
         pull(in)
       }
     }
@@ -268,81 +271,84 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       override def onPush() {
         log.debug(s"$id ==> inport: onPush")
 
-        val data = grab(in)
-        val frames = frameParser.onReceive(data.iterator).iterator
+        grab(in) match {
+          case Left(Disconnect) =>
+            log.info(s"$id Tcp upstream finished, going to close all channels")
+            completeAndCloseAllChannels()
+            completeStage()
 
-        var publishCommands = Vector[AMQCommand[Basic.Publish]]()
-        var ackCommands = Vector[AMQCommand[Basic.Ack]]()
-        var otherCommands = Vector[AMQCommand[AMQMethod]]()
-        var lastCommandOnThisPush: Option[AMQCommand[AMQMethod]] = None
+          case Left(Tick) =>
+            pushHeatbeatOrMessagesOrPull()
 
-        var shouldClose = false
-        while (frames.hasNext && !shouldClose) {
-          frames.next() match {
-            case FrameParser.Ok(Frame(Frame.TICK, _, _)) =>
+          case Right(bytes) =>
+            val frames = frameParser.onReceive(bytes.iterator).iterator
 
-            case FrameParser.Ok(Frame(Frame.DISCONNECT, _, _)) =>
-              log.info(s"$id Tcp upstream finished, going to close all channels")
-              completeAndCloseAllChannels()
-              completeStage()
-              shouldClose = true
+            var publishCommands = Vector[AMQCommand[Basic.Publish]]()
+            var ackCommands = Vector[AMQCommand[Basic.Ack]]()
+            var otherCommands = Vector[AMQCommand[AMQMethod]]()
+            var lastCommandOnThisPush: Option[AMQCommand[AMQMethod]] = None
 
-            case FrameParser.Ok(Frame(Frame.HEARTBEAT, _, _)) =>
-              // TODO check/count heartbeat of this connection? or just let client to deal with it?
-              log.info(s"$id received heartbeat")
+            var shouldClose = false
+            while (frames.hasNext && !shouldClose) {
+              frames.next() match {
+                case FrameParser.Ok(Frame(Frame.HEARTBEAT, _, _)) =>
+                  // TODO check/count heartbeat of this connection? or just let client to deal with it?
+                  log.info(s"$id received heartbeat")
 
-            case FrameParser.Ok(frame) =>
-              log.debug(s"$id got frame: $frame")
+                case FrameParser.Ok(frame) =>
+                  log.debug(s"$id got frame: $frame")
 
-              commandAssembler.onReceive(frame) match {
-                case CommandAssembler.Ok(command) =>
-                  command.method match {
-                    case _: Basic.Ack     => ackCommands :+= command.asInstanceOf[AMQCommand[Basic.Ack]]
-                    case _: Basic.Publish => publishCommands :+= command.asInstanceOf[AMQCommand[Basic.Publish]]
-                    case _                => otherCommands :+= command
+                  commandAssembler.onReceive(frame) match {
+                    case CommandAssembler.Ok(command) =>
+                      command.method match {
+                        case _: Basic.Ack     => ackCommands :+= command.asInstanceOf[AMQCommand[Basic.Ack]]
+                        case _: Basic.Publish => publishCommands :+= command.asInstanceOf[AMQCommand[Basic.Publish]]
+                        case _                => otherCommands :+= command
+                      }
+
+                      lastCommandOnThisPush = Some(command)
+
+                      // reset for next command
+                      commandAssembler = new CommandAssembler()
+                    case error @ CommandAssembler.Error(frame, reason) =>
+                      pushConnectionClose(frame.channel, ErrorCodes.FRAME_ERROR, reason, 0, 0)
+                      log.error(s"$id $error")
+                      shouldClose = true
+
+                    case _ => // Go on - wait for next frame
                   }
 
-                  lastCommandOnThisPush = Some(command)
-
-                  // reset for next command
-                  commandAssembler = new CommandAssembler()
-                case error @ CommandAssembler.Error(frame, reason) =>
-                  pushConnectionClose(frame.channel, ErrorCodes.FRAME_ERROR, reason, 0, 0)
-                  log.error(error.toString)
+                case error @ FrameParser.Error(errorCode, message) =>
+                  pushConnectionClose(0, errorCode, message, 0, 0)
+                  log.error(s"$id $error")
                   shouldClose = true
-
-                case _ => // Go on - wait for next frame
               }
+            } // end frames loop
 
-            case error @ FrameParser.Error(errorCode, message) =>
-              pushConnectionClose(0, errorCode, message, 0, 0)
-              log.error(s"$id S{error.toString}")
-              shouldClose = true
-          }
-        } // end frames loop
+            if (!shouldClose) {
+              lastCommandOnThisPush match {
+                case None =>
+                  // there is no incoming command, do't forget at least to pull(in)
+                  pushHeatbeatOrMessagesOrPull
 
-        if (!shouldClose) {
-          lastCommandOnThisPush match {
-            case None =>
-              pushHeatbeatOrMessagesOrPull()
+                case Some(last) =>
+                  if (otherCommands.length > 1) {
+                    log.warning(s"$id Got batch other commands: $otherCommands")
+                  }
+                  receivedCommands(otherCommands, last)
 
-            case Some(last) =>
-              if (otherCommands.length > 1) {
-                log.warning(s"$id Got batch other commands: $otherCommands")
+                  if (publishCommands.nonEmpty) {
+                    log.debug(s"$id got publish commands: ${publishCommands.size}")
+                    receivedPublishes(publishCommands, isLastCommand = last.method.isInstanceOf[Basic.Publish])
+                  }
+
+                  if (ackCommands.nonEmpty) {
+                    log.debug(s"$id got ack commands: ${ackCommands.size}")
+                    receivedAcks(ackCommands, isLastCommand = last.method.isInstanceOf[Basic.Ack])
+                  }
               }
-              receivedCommands(otherCommands, last)
-
-              if (publishCommands.nonEmpty) {
-                log.debug(s"$id got publish commands: ${publishCommands.size}")
-                receivedPublishes(publishCommands, isLastCommand = last.method.isInstanceOf[Basic.Publish])
-              }
-
-              if (ackCommands.nonEmpty) {
-                log.debug(s"$id got ack commands: ${ackCommands.size}")
-                receivedAcks(ackCommands, isLastCommand = last.method.isInstanceOf[Basic.Ack])
-              }
-          }
-        } // end !shouldClose
+            }
+        }
       }
 
       private def pushHeatbeatOrMessagesOrPull() = {
@@ -389,7 +395,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           val callback = getAsyncCallback[mutable.Set[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { setOfChannelConsumerMsgs =>
             val body = setOfChannelConsumerMsgs.foldLeft(ByteString.newBuilder) {
               case (acc, (consumer @ AMQConsumer(channel, consumerTag, queue, autoAck), msgIds, msgs)) =>
-                log.debug(s"$id delivered msgs: ${msgs.size}")
+                val nMsgs = msgIds.size
+                if (nMsgs > 0) log.info(s"$id delivered msgs: $nMsgs")
+
                 if (autoAck) {
                   // Unrefer should happen after message got. Unrefer could be async
                   msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
@@ -431,7 +439,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       }
 
       private def receivedPublishes(publishes: Vector[AMQCommand[Basic.Publish]], isLastCommand: Boolean) {
-        log.debug(s"$id published msgs: ${publishes.size}")
+        log.info(s"$id published msgs: ${publishes.size}")
 
         // Section 4.7 of the AMQP 0-9-1 core specification explains the 
         // conditions under which ordering is guaranteed: messages published

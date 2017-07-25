@@ -41,10 +41,6 @@ object Frame {
   val HEADER = 2
   val BODY = 3
   val HEARTBEAT = 8
-  /** TICK frame used by ChanaMQ only - Private API */
-  val TICK = 0
-  /** DISCONNECT frame used by ChanaMQ only - Private API */
-  val DISCONNECT = 127 // 0x7F
 
   val FRAME_END = 206
 
@@ -76,22 +72,6 @@ object Frame {
     val buf = ByteString.newBuilder
     val os = new DataOutputStream(buf.asOutputStream)
     Frame(HEARTBEAT, 0, Array()).writeTo(os)
-    os.flush
-    buf.result
-  }
-
-  val TICK_FRAME_BODY: ByteString = {
-    val buf = ByteString.newBuilder
-    val os = new DataOutputStream(buf.asOutputStream)
-    Frame(TICK, 0, Array()).writeTo(os)
-    os.flush
-    buf.result
-  }
-
-  val DISCONNECT_FRAME_BODY: ByteString = {
-    val buf = ByteString.newBuilder
-    val os = new DataOutputStream(buf.asOutputStream)
-    Frame(DISCONNECT, 0, Array()).writeTo(os)
     os.flush
     buf.result
   }

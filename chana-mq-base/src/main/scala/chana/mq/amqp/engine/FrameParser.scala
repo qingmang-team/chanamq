@@ -20,9 +20,9 @@ object FrameParser {
   case object ExpectHeader extends State { def nBytes = 7 }
   final case class ExpectData(nBytes: Int) extends State
 
-  sealed trait ParseResult extends State
-  final case class Ok(frame: Frame) extends ParseResult { def nBytes = 0 }
-  final case class Error(val errorCode: Int, val message: String) extends ParseResult { def nBytes = 0 }
+  sealed trait Result extends State
+  final case class Ok(frame: Frame) extends Result { def nBytes = 0 }
+  final case class Error(errorCode: Int, message: String) extends Result { def nBytes = 0 }
 
   /**
    * ByteIterator.++(that) seems will cut left, we have to define an ugly custom one
@@ -75,7 +75,7 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
   private var input: ByteIterator = ByteString.empty.iterator
   private val payload = ByteString.newBuilder
 
-  def onReceive(newInput: ByteIterator): Vector[ParseResult] = {
+  def onReceive(newInput: ByteIterator): Vector[Result] = {
     input = concat(input, newInput)
     process(Vector())
   }
@@ -84,32 +84,30 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
    * Loopable method
    */
   @tailrec
-  private def process(acc: Vector[ParseResult]): Vector[ParseResult] = {
-    // parse and see if we've finished a frame, add to acc and reset state if true
-    val oldLen = input.len
-    val acc1 = parse(input, state) match {
-      case x: Error =>
-        // when error, we'll drop remaining input
-        input = ByteString.empty.iterator
-        state = ExpectHeader
+  private def process(results: Vector[Result]): Vector[Result] = {
+    // parse and see if we've finished a frame, add to acc and reset state
+    val oldState = state
+    val results1 = parse(input, state) match {
+      case result: Error =>
         payload.clear
-        acc :+ x
-
-      case x: Ok =>
         state = ExpectHeader
-        payload.clear
-        acc :+ x
+        results :+ result
 
-      case x =>
-        state = x
-        acc
+      case result: Ok =>
+        payload.clear
+        state = ExpectHeader
+        results :+ result
+
+      case s =>
+        state = s
+        results
     }
 
     // has more data? go on if true, else wait for more input
-    if (input.hasNext && input.len != oldLen) {
-      process(acc1)
+    if (input.hasNext && state != oldState) {
+      process(results1)
     } else {
-      acc1
+      results1
     }
   }
 
@@ -152,7 +150,7 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
           case Frame.FRAME_END =>
             Ok(Frame(tpe, channel, payload.result.toArray))
           case x =>
-            Error(ErrorCodes.FRAME_ERROR, s"Bad frame end marker: $x")
+            Error(ErrorCodes.FRAME_ERROR, s"Bad frame end marker $x, type=$tpe, channel=$channel, size=$size, payload length=${payload.length}")
         }
       }
 
@@ -188,6 +186,10 @@ final class FrameParser(messageSizeLimit: Long = Long.MaxValue) {
   }
 
   private def read(input: ByteIterator): Int = {
-    if (input.hasNext) (input.next().toInt & 0xff) else -1
+    if (input.hasNext) {
+      input.next().toInt & 0xff
+    } else {
+      -1
+    }
   }
 }

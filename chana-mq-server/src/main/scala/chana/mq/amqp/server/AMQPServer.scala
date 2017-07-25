@@ -16,7 +16,6 @@ import akka.util.ByteString
 import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.entity.MessageEntity
 import chana.mq.amqp.entity.QueueEntity
-import chana.mq.amqp.model.Frame
 import chana.mq.amqp.server.engine.FrameStage
 import chana.mq.amqp.server.engine.TcpStage
 import chana.mq.amqp.server.service.GlobalNodeIdService
@@ -61,12 +60,12 @@ object AMQPServer {
       Flow.fromGraph(GraphDSL.create() { implicit builder =>
         import GraphDSL.Implicits._
 
-        val control = builder.add(Source.tick(0.seconds, 1.micros, Frame.TICK_FRAME_BODY).buffer(1, OverflowStrategy.dropNew))
+        val control = builder.add(Source.tick(0.seconds, 1.micros, Left(engine.Tick)).buffer(1, OverflowStrategy.dropNew))
         val tcpIncoming = builder.add(Flow[ByteString])
         val tcpStage = builder.add(new TcpStage())
         val frameStage = builder.add(new FrameStage())
 
-        val merge = builder.add(MergePreferred[ByteString](1))
+        val merge = builder.add(MergePreferred[Either[engine.Control, ByteString]](1))
         tcpIncoming ~> tcpStage ~> merge.preferred
         control ~> merge.in(0)
         merge ~> frameStage.in
