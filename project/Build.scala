@@ -49,7 +49,7 @@ object Build extends sbt.Build {
     fork in run := true,
     fork in Test := true,
     parallelExecution in Test := false,
-    scalaVersion := "2.12.2",
+    scalaVersion := "2.12.3",
     scalacOptions ++= Seq("-unchecked", "-deprecation"),
     //javacOptions ++= Seq("-source", "1.8", "-target", "1.8"),  // TODO options make javadoc fail
     credentials += Credentials(Path.userHome / ".ivy2" / ".wdj_credentials")

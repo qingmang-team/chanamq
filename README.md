@@ -28,6 +28,10 @@
  * cd bin; ./chana-mq-server &
  * To enable persistent feature, you need to install Cassandra and create chanamq space and tables as [create-cassantra.cql](https://github.com/qingmang-team/chanamq/blob/master/chana-mq-server/src/main/resources/create-cassantra.cql)
 
+## High Available
+
+HA of ChanaMQ is based on Akka cluster HA. It does not support queue mirror, but the message will survive hardward failure and node down if its delivery mode is set to 2 (persistent), and the queue and exchange are both durable. Each message is located on a single node, but will be reloacted to another node and recovered from persistence when this single node is down.
+
 ## License
 
 ChanaMQ server is licensed under the [Apache License version 2.0](LICENSE-APACHE2).
