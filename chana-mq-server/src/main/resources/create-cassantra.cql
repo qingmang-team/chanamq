@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS queues (
 CREATE TABLE IF NOT EXISTS queue_metas (
   id text, -- queue id/name
   lconsumed bigint, -- last consumed offset 
-  nconsumer int, -- consumer count
+  consumers set<text>, -- consumers 
   durable boolean,
   ttl bigint, 
 

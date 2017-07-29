@@ -42,6 +42,7 @@ import chana.mq.amqp.model.ProtocolVersion
 import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.service.ServiceBoard
 import java.util.UUID
+import scala.collection.immutable
 import scala.collection.mutable
 import scala.concurrent.Future
 import scala.concurrent.duration._
@@ -93,14 +94,14 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
   }
 
   private def removeConsumer(channel: AMQChannel, consumerTag: String) {
-    channel.consumers.dequeueFirst(_.consumerTag == consumerTag)
+    channel.consumers.dequeueFirst(_.tag == consumerTag)
     if (channel.consumers.isEmpty) {
       channelsContainConsumer -= channel
     }
   }
 
   private def getConsumer(channel: AMQChannel, consumerTag: String): Option[AMQConsumer] = {
-    channel.consumers.find(_.consumerTag == consumerTag)
+    channel.consumers.find(_.tag == consumerTag)
   }
 
   private def exchangeSharding = ClusterSharding(system).shardRegion(ExchangeEntity.typeName)
@@ -156,7 +157,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
     }
 
     private def completeAndCloseChannel(channel: AMQChannel): Future[mutable.Queue[Boolean]] = {
-      Future.sequence(channel.consumers map { consumer => (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, connection.id)).mapTo[Boolean] }) map { done =>
+      Future.sequence(channel.consumers map { consumer => (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, consumer.channel.channelNumber)).mapTo[Boolean] }) map { done =>
         channel.consumers.clear
         channels -= channel.channelNumber
         channelsContainConsumer -= channel
@@ -251,6 +252,8 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       val frameParser = new FrameParser()
       var commandAssembler = new CommandAssembler()
 
+      var payloadPendingToPush = ByteString.newBuilder
+
       override def onUpstreamFinish() {
         log.info("upstream finished, going to close all channels")
         completeAndCloseAllChannels()
@@ -278,7 +281,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             completeStage()
 
           case Left(Tick) =>
-            pushHeatbeatOrMessagesOrPull()
+            pushHeatbeatOrPendingOrMessagesOrPull()
 
           case Right(bytes) =>
             val frames = frameParser.onReceive(bytes.iterator).iterator
@@ -329,7 +332,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               lastCommandOnThisPush match {
                 case None =>
                   // there is no incoming command, do't forget at least to pull(in)
-                  pushHeatbeatOrMessagesOrPull
+                  pushHeatbeatOrPendingOrMessagesOrPull
 
                 case Some(last) =>
                   if (otherCommands.length > 1) {
@@ -351,11 +354,19 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         }
       }
 
-      private def pushHeatbeatOrMessagesOrPull() = {
+      private def pushHeatbeatOrPendingOrMessagesOrPull() = {
         if (isHeartbeatTime) {
+
           pushHeartbeat()
           log.info(s"$id pushed heartbeat")
           isHeartbeatTime = false
+
+        } else if (payloadPendingToPush.nonEmpty) {
+
+          val payload = payloadPendingToPush.result
+          payloadPendingToPush.clear
+          push(out, payload)
+
         } else if (channelsContainConsumer.nonEmpty) {
 
           // fair play on consumers for each channel
@@ -378,7 +389,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
             log.debug(s"$id prefetchCount: $prefetchCount")
             if (prefetchCount > 0) {
-              (queueSharding ? QueueEntity.Pull(consumer.queue, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
+              (queueSharding ? QueueEntity.Pull(consumer.queue, Some(consumer.tag), connection.id, consumer.channel.channelNumber, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
                 log.debug(s"$id pulled: $msgIds")
                 Future.sequence(msgIds map { msgId =>
                   (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
@@ -433,25 +444,27 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           }
 
           future.foreach(callback.invoke)
+
         } else {
+
           pull(in)
+
         }
       }
 
       private def receivedPublishes(publishes: Vector[AMQCommand[Basic.Publish]], isLastCommand: Boolean) {
-        log.info(s"$id published msgs: ${publishes.size}")
-
         // Section 4.7 of the AMQP 0-9-1 core specification explains the 
         // conditions under which ordering is guaranteed: messages published
         // in one channel, passing through one exchange and one queue and
         // one outgoing channel will be received in the same order that
         // they were sent.  
+        var msgIdToCommand = Map[Long, AMQCommand[Basic.Publish]]()
         val future = Future.sequence(publishes.groupBy(x => x.method.exchange) map {
           case (exchange, commands) =>
             val msgIds = idService.nextIds(commands.size)
 
             Future.sequence((msgIds zip commands) map {
-              case (msgId, AMQCommand(publish, header, body, channelId)) =>
+              case (msgId, command @ AMQCommand(publish, header, body, channelId)) =>
                 log.debug(s"Got $msgId, ${try { new String(body.getOrElse(Array())) } catch { case ex: Throwable => "" }}")
 
                 val isPersist = header match {
@@ -478,27 +491,68 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                 }
 
                 (messageSharding ? MessageEntity.Received(msgId.toString, header, body, publish.exchange, publish.routingKey, ttl)).mapTo[Boolean] map { _ =>
-                  ExchangeEntity.Publish(msgId, publish, body.map(_.length).getOrElse(0), isPersist, ttl)
+                  msgIdToCommand += (msgId -> command)
+                  ExchangeEntity.Publish(msgId, publish.routingKey, publish.mandatory, publish.immediate, body.map(_.length).getOrElse(0), isPersist, ttl)
                 }
             }) flatMap {
               case pubs =>
-                (exchangeSharding ? ExchangeEntity.Publishs(exchange, pubs)).mapTo[Vector[Boolean]] map { undeliverables =>
-                  pubs zip undeliverables
-                }
+                (exchangeSharding ? ExchangeEntity.Publishs(exchange, pubs, connection.id)).mapTo[Vector[(Long, Boolean, Boolean)]]
             }
         }) andThen {
-          case Success(_) =>
+          case Success(_) => log.info(s"$id published msgs: ${publishes.size}")
           case Failure(e) => log.error(e, e.getMessage)
         }
 
-        val callback = getAsyncCallback[Iterable[List[(ExchangeEntity.Publish, Boolean)]]] { xs =>
-          val undeliverables = xs.flatten.filter(_._2).map(_._1) // TODO check mandatory and immediate
-          // if not isLastCommand, means we are still under same onPush (
-          // received multiple commands on one push), we should not push 
-          // or pull on port until isLastCommand.
-          if (isLastCommand) {
-            pushHeatbeatOrMessagesOrPull()
-          }
+        val callback = getAsyncCallback[immutable.Iterable[Vector[(Long, Boolean, Boolean)]]] {
+          case exchangesToResults =>
+            val (mandatoryReturns, immediateReturns) = exchangesToResults.flatten.foldLeft((Vector[AMQCommand[Basic.Publish]](), Vector[AMQCommand[Basic.Publish]]())) {
+              case ((mandatoryReturns, immediateReturns), (msgId, isNonRouted, isNonDeliverable)) =>
+                msgIdToCommand.get(msgId) match {
+                  case Some(command) =>
+                    if (command.method.immediate && isNonDeliverable) {
+                      (mandatoryReturns, immediateReturns :+ command)
+                    } else {
+                      if (command.method.mandatory && isNonRouted) {
+                        (mandatoryReturns :+ command, immediateReturns)
+                      } else {
+                        (mandatoryReturns, immediateReturns)
+                      }
+                    }
+                  case None => // this should not happen
+                    (mandatoryReturns, immediateReturns)
+                }
+            }
+
+            payloadPendingToPush = mandatoryReturns.foldLeft(ByteString.newBuilder) {
+              case (acc, AMQCommand(Basic.Publish(_, exchange, routingKey, _, _), header, body, channelId)) =>
+                channels.get(channelId) match {
+                  case Some(channel) =>
+                    val command = AMQCommand(Basic.Return(ErrorCodes.NO_ROUTE, ErrorCodes.noRoute, exchange, routingKey), header, body)
+                    val payload = channel.render(command)
+                    acc ++= payload
+                  case None =>
+                    acc
+                }
+            }
+
+            payloadPendingToPush = immediateReturns.foldLeft(payloadPendingToPush) {
+              case (acc, AMQCommand(Basic.Publish(_, exchange, routingKey, _, _), header, body, channelId)) =>
+                channels.get(channelId) match {
+                  case Some(channel) =>
+                    val command = AMQCommand(Basic.Return(ErrorCodes.NO_CONSUMERS, ErrorCodes.noConsumers, exchange, routingKey), header, body)
+                    val payload = channel.render(command)
+                    acc ++= payload
+                  case None =>
+                    acc
+                }
+            }
+
+            // if not isLastCommand, means we are still under same onPush (
+            // received multiple commands on one push), we should not push 
+            // or pull on port until isLastCommand.
+            if (isLastCommand) {
+              pushHeatbeatOrPendingOrMessagesOrPull()
+            }
         }
 
         future.foreach(callback.invoke)
@@ -526,7 +580,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                   consumer.nUnacks -= count
                   consumer.unackedMessages --= ackedMsgIds
                   unackedMessageToConsumer --= ackedMsgIds
-                  log.info(s"unacked: ${consumer.consumerTag} ${consumer.unackedMessages.size}")
+                  log.info(s"unacked: ${consumer.tag} ${consumer.unackedMessages.size}")
 
                   ackedMsgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
                   (queueSharding ? QueueEntity.Acked(consumer.queue, ackedMsgIds.toList)).mapTo[Boolean]
@@ -534,7 +588,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                   consumer.nUnacks -= 1
                   consumer.unackedMessages -= deliveryTag
                   unackedMessageToConsumer -= deliveryTag
-                  log.info(s"unacked: ${consumer.consumerTag} ${consumer.unackedMessages.size}")
+                  log.info(s"unacked: ${consumer.tag} ${consumer.unackedMessages.size}")
 
                   messageSharding ! MessageEntity.Unrefer(deliveryTag.toString)
                   (queueSharding ? QueueEntity.Acked(consumer.queue, List(deliveryTag))).mapTo[Boolean]
@@ -550,7 +604,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
         val callback = getAsyncCallback[Vector[Boolean]] { xs =>
           if (isLastCommand) {
-            pushHeatbeatOrMessagesOrPull()
+            pushHeatbeatOrPendingOrMessagesOrPull()
           }
         }
 
@@ -943,7 +997,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         method match {
           case Basic.Consume(reserved_1, queue, consumerTag, noLocal, noAck, exclusive, nowait, arguments) =>
             withChannel(channelId, method) { channel =>
-              val future = (queueSharding ? QueueEntity.ConsumerStarted(queue, connection.id)).mapTo[Boolean] andThen {
+              val future = (queueSharding ? QueueEntity.ConsumerStarted(queue, consumerTag, connection.id, channelId)).mapTo[Boolean] andThen {
                 case Success(_) =>
                 case Failure(e) => log.error(e, e.getMessage)
               }
@@ -970,7 +1024,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             withChannel(channelId, method) { channel =>
               getConsumer(channel, consumerTag) match {
                 case Some(consumer) =>
-                  val future = (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, connection.id)).mapTo[Boolean] andThen {
+                  val future = (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, channelId)).mapTo[Boolean] andThen {
                     case Success(_) =>
                     case Failure(e) => log.error(e, e.getMessage)
                   }
@@ -998,7 +1052,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           case Basic.Get(reserved_1, queue, autoAck) =>
             withChannel(channelId, method) { channel =>
 
-              val future = (queueSharding ? QueueEntity.Pull(queue, 1, Long.MaxValue, autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
+              val future = (queueSharding ? QueueEntity.Pull(queue, None, connection.id, channelId, 1, Long.MaxValue, autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
                 Future.sequence(msgIds map { msgId =>
                   (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
                 })

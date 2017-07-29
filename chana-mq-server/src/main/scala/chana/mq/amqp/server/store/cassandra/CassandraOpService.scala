@@ -172,7 +172,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   // TODO ! select from time needs to create another table with primary key as (id, msgid) and change following as msgid >= ?
   val selectQueueMsgFromTimeStmt = session.prepare("SELECT id, offset, msgid, size, TTL(msgid) FROM queues WHERE id = ? AND offset >= ? ORDER BY offset ASC;")
 
-  val insertQueueMetaStmt = session.prepare("INSERT INTO queue_metas (id, lconsumed, nconsumer, durable, ttl) VALUES (?, ?, ?, ?, ?);")
+  val insertQueueMetaStmt = session.prepare("INSERT INTO queue_metas (id, lconsumed, consumers, durable, ttl) VALUES (?, ?, ?, ?, ?);")
+  val insertQueueMetaLastConsumedStmt = session.prepare("INSERT INTO queue_metas (id, lconsumed) VALUES (?, ?);")
   val deleteQueueMetaStmt = session.prepare("DELETE FROM queue_metas WHERE id = ?;")
   val selectQueueMetaStmt = session.prepare("SELECT * FROM queue_metas WHERE id = ?;")
 
@@ -206,12 +207,12 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   private def _selectQueueMeta(id: String) = selectQueueMetaStmt.bind(id)
   private def _deleteQueueMeta(id: String) = deleteQueueMetaStmt.bind(id)
-  private def _insertQueueMeta(id: String, lconsumed: Long, nconsumer: Int, isDurable: Boolean, queueMsgTtl: Option[Long]) = {
+  private def _insertQueueMeta(id: String, lconsumed: Long, consumers: Set[String], isDurable: Boolean, queueMsgTtl: Option[Long]) = {
     val bs = new BoundStatement(insertQueueMetaStmt)
 
     bs.setString(0, id)
     bs.setLong(1, lconsumed)
-    bs.setInt(2, nconsumer)
+    bs.setSet(2, consumers.asJava)
     bs.setBool(3, isDurable)
 
     queueMsgTtl foreach { x =>
@@ -220,6 +221,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
     bs
   }
+  private def _insertQueueMetaLastConsumed(id: String, lconsumed: Long) = insertQueueMetaLastConsumedStmt.bind(id, lconsumed.asInstanceOf[AnyRef])
 
   private def _selectQueueUnack(id: String) = selectQueueUnackStmt.bind(id)
   private def _deleteQueueUnack(id: String, msgId: Long) = deleteQueueUnackStmt.bind(id, msgId.asInstanceOf[AnyRef])
@@ -251,12 +253,12 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
     bs
   }
-  private def _insertQueueMetaDeleted(id: String, lconsumed: Long, nconsumer: Int, isDurable: Boolean, queueMsgTtl: Option[Long]) = {
+  private def _insertQueueMetaDeleted(id: String, lconsumed: Long, consumers: Set[String], isDurable: Boolean, queueMsgTtl: Option[Long]) = {
     val bs = new BoundStatement(insertQueueMetaDeletedStmt)
 
     bs.setString(0, id)
     bs.setLong(1, lconsumed)
-    bs.setInt(2, nconsumer)
+    bs.setSet(2, consumers.asJava)
     bs.setBool(3, isDurable)
 
     queueMsgTtl foreach { x =>
@@ -313,16 +315,16 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     } map (_ => ())
   }
 
-  private def doSelectQueueMeta(id: String): Future[Option[(Long, Int, Boolean, Option[Long])]] = {
+  private def doSelectQueueMeta(id: String): Future[Option[(Long, Set[String], Boolean, Option[Long])]] = {
     execute(_selectQueueMeta(id)) map { rs =>
       val raws = rs.iterator
       if (raws.hasNext) {
         val raw = raws.next()
         val lastConsumed = raw.getLong("lconsumed")
-        val consumerCount = raw.getInt("nconsumer")
+        val consumers = raw.getSet("consumers", classOf[String]).asScala.toSet
         val isDurable = raw.getBool("durable")
         val ttl = if (raw.isNull("ttl")) None else Some(raw.getLong("ttl"))
-        Some((lastConsumed, consumerCount, isDurable, ttl))
+        Some((lastConsumed, consumers, isDurable, ttl))
       } else {
         None
       }
@@ -355,10 +357,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     } getOrElse (0L)
 
     execute(_insertMsg(id, timestamp, headerBytes, body map ByteBuffer.wrap, exchange, routing, isDurable, referCount, ttl)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted Msg of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert msg of $id")
+      case Success(_) => log.info(s"Inserted Msg of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert msg of $id")
     }
   }
 
@@ -366,10 +366,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     val start = System.currentTimeMillis
 
     execute(_updateMsgReferCount(id, referCount)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Updated Msg referCount of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to update msg referCount of $id")
+      case Success(_) => log.info(s"Updated Msg referCount of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to update msg referCount of $id")
     }
   }
 
@@ -392,79 +390,67 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
         None
       }
     } andThen {
-      case Success(_) =>
-        log.info(s"Selected msg of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to select msg of $id")
+      case Success(_) => log.info(s"Selected msg of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to select msg of $id")
     }
   }
 
   def deleteMessage(id: Long) = {
     val start = System.currentTimeMillis
     execute(_deleteMsg(id)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Deleted msg of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to delete msg of $id")
+      case Success(_) => log.info(s"Deleted msg of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete msg of $id")
     }
   }
 
-  def insertQueueMeta(id: String, lastConsumed: Long, consumerCount: Int, isDurable: Boolean, queueMsgTtl: Option[Long]) = {
+  def insertQueueMeta(id: String, lastConsumed: Long, consumers: Set[String], isDurable: Boolean, queueMsgTtl: Option[Long]) = {
     val start = System.currentTimeMillis
-    execute(_insertQueueMeta(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted queue meta of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert queue meta of $id")
+    execute(_insertQueueMeta(id, lastConsumed, consumers, isDurable, queueMsgTtl)) map (_ => ()) andThen {
+      case Success(_) => log.info(s"Inserted queue meta of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert queue meta of $id")
     }
   }
 
   def insertQueueMsg(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]) = {
     val start = System.currentTimeMillis
     execute(_insertQueueMsg(id, offset, msgId, size, ttl)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert queue of $id")
+      case Success(_) => log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert queue of $id")
     }
   }
 
   def deleteQueueMsgs(id: String) = {
     val start = System.currentTimeMillis
     execute(_deleteQueueMsg(id)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert queue of $id")
+      case Success(_) => log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert queue of $id")
     }
   }
 
-  def consumedQueueMessages(id: String, lastConsumed: Long, consumerCount: Int, isDurable: Boolean, queueMsgTtl: Option[Long], unacks: Vector[Long]) = {
+  def consumedQueueMessages(id: String, lastConsumed: Long, unacks: Vector[Long]) = {
     val start = System.currentTimeMillis
     if (unacks.isEmpty) {
       Future.sequence(List(
-        execute(_insertQueueMeta(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)),
+        execute(_insertQueueMetaLastConsumed(id, lastConsumed)),
         execute(_deleteQueueMsgBeforeOffset(id, lastConsumed))
       )) map (_ => ())
     } else {
       Future.sequence(List(
-        execute(_insertQueueMeta(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)),
+        execute(_insertQueueMetaLastConsumed(id, lastConsumed)),
         execute(_deleteQueueMsgBeforeOffset(id, lastConsumed)),
         Future.sequence(unacks map { msgId => execute(_insertQueueUnack(id, msgId)) })
       )) map (_ => ())
     } andThen {
-      case Success(_) =>
-        log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert queue of $id")
+      case Success(_) => log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert queue of $id")
     }
   }
 
   def selectQueue(id: String) = {
     val start = System.currentTimeMillis
     doSelectQueueMeta(id) flatMap {
-      case Some((lastConsumed, consumerCount, isDurable, queueMsgTtl)) =>
-        log.debug(s"$lastConsumed, $consumerCount, $isDurable")
+      case Some((lastConsumed, consumers, isDurable, queueMsgTtl)) =>
+        log.debug(s"$lastConsumed, $consumers, $isDurable")
         execute(_selectQueueUnack(id)) map { rs =>
           var unacks = Vector[Long]()
           val raws = rs.iterator
@@ -488,35 +474,31 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
               msgs :+= Msg(msgId, offset, size, expireTime)
             }
             log.debug(s"$msgs")
-            Some(Queue(lastConsumed, consumerCount, isDurable, queueMsgTtl, msgs, unacks))
+            Some(Queue(lastConsumed, consumers, isDurable, queueMsgTtl, msgs, unacks))
           }
         }
 
       case None =>
         Future.successful(None)
     } andThen {
-      case Success(_) =>
-        log.info(s"Selected queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to select queue of $id")
+      case Success(_) => log.info(s"Selected queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to select queue of $id")
     }
   }
 
   def forceDeleteQueue(id: String) = {
     val start = System.currentTimeMillis
     doDeleteQueue(id) andThen {
-      case Success(_) =>
-        log.info(s"Force deleted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to force delete queue of $id")
+      case Success(_) => log.info(s"Force deleted queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to force delete queue of $id")
     }
   }
 
   def pendingDeleteQueue(id: String) = {
     val start = System.currentTimeMillis
     val copyToDeleted = doSelectQueueMeta(id) flatMap {
-      case Some((lastConsumed, consumerCount, isDurable, queueMsgTtl)) =>
-        execute(_insertQueueMetaDeleted(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)) flatMap { _ =>
+      case Some((lastConsumed, consumers, isDurable, queueMsgTtl)) =>
+        execute(_insertQueueMetaDeleted(id, lastConsumed, consumers, isDurable, queueMsgTtl)) flatMap { _ =>
           execute(_selectQueueUnack(id)) flatMap { rs =>
             val unacks = new mutable.ListBuffer[Future[Unit]]()
             val raws = rs.iterator
@@ -549,10 +531,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
     // delete original queue
     copyToDeleted flatMap { _ => doDeleteQueue(id) } andThen {
-      case Success(_) =>
-        log.info(s"Pending deleted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to pending delete queue of $id")
+      case Success(_) => log.info(s"Pending deleted queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to pending delete queue of $id")
     }
   }
 
@@ -564,10 +544,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
       case None =>
         Future.successful(())
     } andThen {
-      case Success(_) =>
-        log.info(s"Deleted queue consumed messages of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to delete queue consumed messages of $id")
+      case Success(_) => log.info(s"Deleted queue consumed messages of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete queue consumed messages of $id")
     }
   }
 
@@ -576,40 +554,32 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     Future.sequence(msgIds map { msgId =>
       execute(_insertQueueUnack(id, msgId))
     }) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted unacks of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert unacks of $id")
+      case Success(_) => log.info(s"Inserted unacks of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert unacks of $id")
     }
   }
 
   def deleteQueueUnack(id: String, msgId: Long) = {
     val start = System.currentTimeMillis
     execute(_deleteQueueUnack(id, msgId)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Deleted unacks of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to delete unacks of $id")
+      case Success(_) => log.info(s"Deleted unacks of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete unacks of $id")
     }
   }
 
   def insertExchange(id: String, tpe: String, isDurable: Boolean, isAutoDelete: Boolean, isInternal: Boolean, args: java.util.Map[String, Any]) = {
     val start = System.currentTimeMillis
     execute(_insertExchange(id, tpe, isDurable, isAutoDelete, isInternal, args)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert exchange of $id")
+      case Success(_) => log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert exchange of $id")
     }
   }
 
   def insertExchangeBind(id: String, queue: String, routingKey: String, args: java.util.Map[String, Any]) = {
     val start = System.currentTimeMillis
     execute(_insertExchangeBind(id, queue, routingKey, args)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert exchange of $id")
+      case Success(_) => log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert exchange of $id")
     }
   }
 
@@ -646,30 +616,24 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
       case None =>
         Future.successful(None)
     } andThen {
-      case Success(_) =>
-        log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to insert exchange of $id")
+      case Success(_) => log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert exchange of $id")
     }
   }
 
   def deleteExchangeBind(id: String, queue: String, routingKey: String) = {
     val start = System.currentTimeMillis
     execute(_deleteExchangeBind(id, queue, routingKey)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Deleted exchange bind of $id $queue $routingKey in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to delete exchange bind of $id $queue $routingKey")
+      case Success(_) => log.info(s"Deleted exchange bind of $id $queue $routingKey in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete exchange bind of $id $queue $routingKey")
     }
   }
 
   def deleteExchangeBindsOfQueue(id: String, queue: String) = {
     val start = System.currentTimeMillis
     execute(_deleteExchangeBindsOfQueue(id, queue)) map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Deleted exchange binds of $id $queue in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to delete exchange binds of $id $queue")
+      case Success(_) => log.info(s"Deleted exchange binds of $id $queue in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete exchange binds of $id $queue")
     }
   }
 
@@ -678,10 +642,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     execute(_deleteExchange(id)) flatMap { _ =>
       execute(_deleteExchangeBinds(id))
     } map (_ => ()) andThen {
-      case Success(_) =>
-        log.info(s"Deleted exchange of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(ex) =>
-        log.error(ex, s"Failed to delete exchange of $id")
+      case Success(_) => log.info(s"Deleted exchange of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete exchange of $id")
     }
   }
 

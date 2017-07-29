@@ -16,10 +16,10 @@ package object store {
     def selectMessage(id: Long): Future[Option[(Message, Boolean, Int)]]
     def deleteMessage(id: Long): Future[Unit]
 
-    def insertQueueMeta(id: String, lastConsumed: Long, consumerCount: Int, isDurable: Boolean, queueMsgTtl: Option[Long]): Future[Unit]
+    def insertQueueMeta(id: String, lastConsumed: Long, consumers: Set[String], isDurable: Boolean, queueMsgTtl: Option[Long]): Future[Unit]
     def insertQueueMsg(id: String, startOffset: Long, msgId: Long, size: Int, ttl: Option[Long]): Future[Unit]
     def deleteQueueMsgs(id: String): Future[Unit]
-    def consumedQueueMessages(id: String, lastConsumed: Long, consumerCount: Int, isDurable: Boolean, queueMsgTtl: Option[Long], unacks: Vector[Long]): Future[Unit]
+    def consumedQueueMessages(id: String, lastConsumed: Long, unacks: Vector[Long]): Future[Unit]
     def selectQueue(id: String): Future[Option[Queue]]
     def forceDeleteQueue(id: String): Future[Unit]
     def pendingDeleteQueue(id: String): Future[Unit]

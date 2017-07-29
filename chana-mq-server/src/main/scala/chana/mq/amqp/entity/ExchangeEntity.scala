@@ -18,7 +18,6 @@ import chana.mq.amqp.Loaded
 import chana.mq.amqp.Command
 import chana.mq.amqp.Exchange
 import chana.mq.amqp.Msg
-import chana.mq.amqp.method.Basic
 import chana.mq.amqp.model.AMQP
 import chana.mq.amqp.server.engine.DirectMatcher
 import chana.mq.amqp.server.engine.FanoutMatcher
@@ -90,9 +89,9 @@ object ExchangeEntity {
   final case class QueueBind(id: String, queue: String, routingKey: String, arguments: Map[String, Any]) extends Command
   final case class QueueUnbind(id: String, queue: String, routingKey: String, arguments: Map[String, Any]) extends Command
   final case class QueueUnbindAll(id: String, queue: String) extends Command
-  final case class Publishs(id: String, publishes: List[Publish]) extends Command
+  final case class Publishs(id: String, publishes: List[Publish], connectionId: Int) extends Command
 
-  final case class Publish(msgId: Long, publish: Basic.Publish, bodySize: Int, isMsgPersist: Boolean, ttl: Option[Long])
+  final case class Publish(msgId: Long, routingKey: String, mandatory: Boolean, immediate: Boolean, bodySize: Int, isMsgPersist: Boolean, ttl: Option[Long])
 
   final case class TopicSubscriber(queue: String, isDurable: Boolean) extends Subscriber
 
@@ -271,44 +270,60 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
           commander ! true
       }
 
-    case ExchangeEntity.Publishs(_, publishes) =>
+    case ExchangeEntity.Publishs(_, publishes, connectionId) =>
       val commander = sender()
 
-      publish(publishes) map { deliverables =>
-        commander ! deliverables
+      publish(publishes, connectionId) map { results =>
+        commander ! results
       }
 
     case _ =>
   }
 
-  private def publish(publishes: List[ExchangeEntity.Publish]): Future[Vector[Boolean]] = {
+  private def publish(publishes: List[ExchangeEntity.Publish], connectionId: Int): Future[Vector[(Long, Boolean, Boolean)]] = {
     log.debug(s"publishes: $publishes")
 
     val now = System.currentTimeMillis
+    var msgRefers = Vector[(MessageEntity.Refer, collection.Set[String], Boolean, Boolean)]()
     var queueToMsgs = Map[String, Vector[Msg]]()
-    var msgRefers = Vector[MessageEntity.Refer]()
     publishes foreach {
-      case ExchangeEntity.Publish(msgId, Basic.Publish(_, exchange, routingKey, mandatory, immediate), bodySize, isMsgPersist, ttl) =>
+      case ExchangeEntity.Publish(msgId, routingKey, mandatory, immediate, bodySize, isMsgPersist, ttl) =>
+        // per message processing
         log.debug(s"matcher: ${queueMatcher}")
-        val queues = queueMatcher.lookup(routingKey).asInstanceOf[collection.Set[ExchangeEntity.TopicSubscriber]]
-        log.debug(s"subs of '${routingKey}': ${queues}")
+        val queueSubs = queueMatcher.lookup(routingKey).asInstanceOf[collection.Set[ExchangeEntity.TopicSubscriber]]
+        log.debug(s"subs of '${routingKey}': ${queueSubs}")
 
-        val isDurable = this.isDurable && isMsgPersist && queues.map(_.isDurable).foldLeft(false)(_ || _)
-        msgRefers :+= MessageEntity.Refer(msgId.toString, queues.size, isDurable)
+        val queues = queueSubs.map(_.queue)
+
+        val isPersistet = this.isDurable && isMsgPersist && queueSubs.map(_.isDurable).foldLeft(false)(_ || _)
+        msgRefers :+= (MessageEntity.Refer(msgId.toString, queues.size, isPersistet), queues, mandatory, immediate)
+
         queues foreach { queue =>
-          queueToMsgs += (queue.queue -> (queueToMsgs.getOrElse(queue.queue, Vector()) :+ Msg(msgId, 0, bodySize, ttl.map(_ + now))))
+          queueToMsgs += (queue -> (queueToMsgs.getOrElse(queue, Vector()) :+ Msg(msgId, 0, bodySize, ttl.map(_ + now))))
         }
     }
 
     log.debug(s"queueToMsgs: $queueToMsgs")
 
-    Future.sequence(msgRefers map { ref =>
-      (messageSharding ? ref).mapTo[Boolean]
+    Future.sequence(msgRefers map {
+      case (msgRef, _, _, _) =>
+        (messageSharding ? msgRef).mapTo[Boolean]
     }) flatMap { _ =>
       Future.sequence(queueToMsgs map {
-        case (queue, msgs) => (queueSharding ? QueueEntity.Push(queue, msgs)).mapTo[Boolean]
+        case (queue, msgs) => (queueSharding ? QueueEntity.Push(queue, msgs, connectionId)).mapTo[Boolean] map (hasConsumer => (queue, hasConsumer))
       })
-    } map (_ => msgRefers.map(_.count > 0))
+    } map { queueToConsumerCount =>
+      val queuesWithConsumer = queueToConsumerCount.collect {
+        case (queue, true) => queue
+      } toSet
+
+      msgRefers map {
+        case (msgRef, queues, mandatory, immediate) =>
+          val isNonDeliverable = immediate && queues.find(queuesWithConsumer.contains).isEmpty
+          val isNonRouted = mandatory && msgRef.count == 0
+          (msgRef.id.toLong, isNonRouted, isNonDeliverable)
+      }
+    }
   }
 
   private def queueBind(bind: ExchangeEntity.QueueBind): Future[Unit] = {

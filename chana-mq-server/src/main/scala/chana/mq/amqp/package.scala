@@ -20,5 +20,5 @@ package object amqp {
     def expired(now: Long): Boolean = expireTime.map(_ < now).getOrElse(false)
   }
   private[amqp] final case class Message(id: Long, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routingKey: String, ttl: Option[Long])
-  private[amqp] final case class Queue(lastConsumed: Long, consumerCount: Int, isDurable: Boolean, queueMsgTtl: Option[Long], mags: Vector[Msg], unacks: Vector[Long])
+  private[amqp] final case class Queue(lastConsumed: Long, consumers: Set[String], isDurable: Boolean, queueMsgTtl: Option[Long], mags: Vector[Msg], unacks: Vector[Long])
 }

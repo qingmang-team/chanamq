@@ -21,12 +21,14 @@ object ErrorCodes {
    * the mandatory flag is set.
    */
   val NO_ROUTE = 312
+  val noRoute = "The exchange cannot route the result of a Publish"
 
   /**
    * When the exchange cannot deliver to a consumer when the immediate flag is set. As a result of pending data on
    * the queue or the absence of any consumers of the queue.
    */
   val NO_CONSUMERS = 313
+  val noConsumers = "The exchange cannot deliver to a consumer when the immediate flag is set"
 
   /**
    * An operator intervened to close the connection for some reason. The client may retry at some later date.

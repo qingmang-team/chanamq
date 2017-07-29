@@ -54,7 +54,7 @@ object MessageEntity {
 
   final case class Received(id: String, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routing: String, ttl: Option[Long]) extends Command
   final case class Get(id: String) extends Command
-  final case class Refer(id: String, count: Int, isDurable: Boolean) extends Command
+  final case class Refer(id: String, count: Int, isPersistent: Boolean) extends Command
   final case class Unrefer(id: String) extends Command
 
 }
@@ -69,7 +69,7 @@ final class MessageEntity extends Actor with ActorLogging {
   def storeService = serviceBoard.storeService
 
   private var message: Message = _
-  private var isDurable = false
+  private var isPersistent = false
 
   private var referCount = 0
   private var isSavingOrSaved = false
@@ -82,7 +82,7 @@ final class MessageEntity extends Actor with ActorLogging {
     storeService.selectMessage(longId) map {
       case Some((msg, isDurable, referCount)) =>
         this.message = msg
-        this.isDurable = isDurable
+        this.isPersistent = isDurable
         this.referCount = referCount
         this.isSavingOrSaved = true
         setTTL(msg.ttl)
@@ -131,17 +131,17 @@ final class MessageEntity extends Actor with ActorLogging {
         commander ! Option(message)
       }
 
-    case MessageEntity.Refer(_, count, isDurable) =>
+    case MessageEntity.Refer(_, count, isPersistent) =>
       val commander = sender()
       lastActiveTime = LocalDateTime.now()
 
-      this.isDurable = isDurable
+      this.isPersistent = isPersistent
       this.referCount += count
       log.debug(s"referCount after Referred $referCount")
 
-      val persist = if (isDurable && !isSavingOrSaved && message != null) {
+      val persist = if (isPersistent && !isSavingOrSaved && message != null) {
         isSavingOrSaved = true
-        storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, isDurable, referCount, message.ttl)
+        storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, isPersistent, referCount, message.ttl)
       } else {
         Future.successful(())
       }
@@ -160,7 +160,7 @@ final class MessageEntity extends Actor with ActorLogging {
         }
         self ! PoisonPill
       } else {
-        if (isDurable) {
+        if (isPersistent) {
           storeService.updateMessageReferCount(longId, referCount)
         }
       }
@@ -175,7 +175,7 @@ final class MessageEntity extends Actor with ActorLogging {
       if (LocalDateTime.now().minusSeconds(inactiveInterval).isAfter(lastActiveTime)) {
         val persist = if (!isSavingOrSaved && message != null) {
           isSavingOrSaved = true
-          storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, isDurable, referCount, message.ttl)
+          storeService.insertMessage(longId, message.header, message.body, message.exchange, message.routingKey, isPersistent, referCount, message.ttl)
         } else {
           Future.successful(())
         }

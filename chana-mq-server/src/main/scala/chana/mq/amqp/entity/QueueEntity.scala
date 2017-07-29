@@ -19,6 +19,7 @@ import chana.mq.amqp.Loaded
 import chana.mq.amqp.Unlock
 import chana.mq.amqp.Msg
 import chana.mq.amqp.Queue
+import chana.mq.amqp.model.AMQConsumer
 import chana.mq.amqp.server.service.ServiceBoard
 import chana.mq.amqp.server.store
 import scala.collection.mutable
@@ -61,12 +62,12 @@ object QueueEntity {
   final case class Purge(id: String, connectionId: Int) extends Command
 
   final case class IsDurable(id: String) extends Command
-  final case class Push(id: String, msgs: Vector[Msg]) extends Command
-  final case class Pull(id: String, prefetchCount: Int, prefetchSize: Long, autoAck: Boolean) extends Command
+  final case class Push(id: String, msgs: Vector[Msg], connectionId: Int) extends Command
+  final case class Pull(id: String, consumerTag: Option[String], connectionId: Int, channelId: Int, prefetchCount: Int, prefetchSize: Long, autoAck: Boolean) extends Command
   final case class Acked(id: String, msgId: List[Long]) extends Command
 
-  final case class ConsumerStarted(id: String, connectionId: Int) extends Command
-  final case class ConsumerCancelled(id: String, connectionId: Int) extends Command
+  final case class ConsumerStarted(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
+  final case class ConsumerCancelled(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
 
   /** Event publish to "amqp.queue" */
   final case class QueueDeleted(queue: String)
@@ -93,7 +94,8 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
 
   private var unacks = Set[Long]()
 
-  private var consumerCount: Int = _
+  // TODO for case of connection suddenly boken on server side, we should check last active time of consumers to remove it
+  private var consumerToLastActive = Map[String, Long]()
 
   private val mediator = DistributedPubSub(context.system).mediator
 
@@ -105,15 +107,16 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
   private def load(): Future[Unit] = {
     log.info(s"$id loading...")
     storeService.selectQueue(id) map {
-      case Some(Queue(lastConsumed, consumerCount, isDurable, queueMsgTtl, msgs, unacks)) =>
+      case Some(Queue(lastConsumed, consumers, isDurable, queueMsgTtl, msgs, unacks)) =>
         this.isPassiveCreated = false
 
-        //this.consumerCount = consumerCount // We can not keep consistence of consumerCount during a server restart?
         this.isDurable = isDurable
         this.lastConsumed = lastConsumed
         this.queueMsgTtl = queueMsgTtl
         this.messageIds = msgs
         this.unacks ++= unacks
+        val now = System.currentTimeMillis
+        this.consumerToLastActive = consumers.map(_ -> now).toMap
 
       case None =>
     } andThen {
@@ -137,7 +140,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
     case Loaded =>
       context.become(ready)
       unstashAll()
-      log.info(s"$id loaded: messageCount=${messageIds.length}, lastConsumed=$lastConsumed, consumerCount=$consumerCount, isDurable=$isDurable, unacked=$unacks")
+      log.info(s"$id loaded: messageCount=${messageIds.length}, lastConsumed=$lastConsumed, consumers=${consumerToLastActive.size}, isDurable=$isDurable, unacked=$unacks")
     case _ =>
       stash()
   }
@@ -189,10 +192,11 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         case (false, _) =>
       }
 
-    case QueueEntity.Purge(_, connectionId) =>
+    case m @ QueueEntity.Purge(_, connectionId) =>
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
+        log.error(s"$m: access exclusive queue from another connection")
         commander ! (false, 0)
       } else {
         val nPurged = messageIds.length
@@ -209,16 +213,17 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case QueueEntity.ConsumerStarted(_, connectionId) =>
+    case m @ QueueEntity.ConsumerStarted(_, tag, connectionId, channelId) =>
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
+        log.error(s"$m: access exclusive queue from another connection")
         commander ! false
       } else {
-        consumerCount += 1
+        consumerToLastActive += (AMQConsumer.globalId(tag, connectionId, channelId) -> System.currentTimeMillis)
 
         val persist = if (isDurable) {
-          storeService.insertQueueMeta(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)
+          storeService.insertQueueMeta(id, lastConsumed, consumerToLastActive.keySet, isDurable, queueMsgTtl)
         } else {
           Future.successful(())
         }
@@ -228,15 +233,16 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case QueueEntity.ConsumerCancelled(_, connectionId) =>
+    case m @ QueueEntity.ConsumerCancelled(_, tag, connectionId, channelId) =>
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
+        log.error(s"$m: access exclusive queue from another connection")
         commander ! false
       } else {
-        consumerCount -= 1
+        consumerToLastActive -= AMQConsumer.globalId(tag, connectionId, channelId)
 
-        if (isAutoDelete && consumerCount == 0) {
+        if (isAutoDelete && consumerToLastActive.isEmpty) {
           mediator ! Publish(ExchangeEntity.Topic, QueueEntity.QueueDeleted(id))
 
           val persist = if (isDurable) {
@@ -251,7 +257,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
           }
         } else {
           val persist = if (isDurable) {
-            storeService.insertQueueMeta(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)
+            storeService.insertQueueMeta(id, lastConsumed, consumerToLastActive.keySet, isDurable, queueMsgTtl)
           } else {
             Future.successful(())
           }
@@ -262,8 +268,13 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case QueueEntity.Push(_, msgs) =>
+    case m @ QueueEntity.Push(_, msgs, connectionId) =>
       val commander = sender()
+
+      if (isExclusive && this.connectionId != connectionId) {
+        log.error(s"$m: access exclusive queue from another connection")
+        commander ! false
+      }
 
       log.debug(s"$id msgs pushed in: $msgs")
 
@@ -297,77 +308,85 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       }
 
       persist map { _ =>
-        commander ! isDurable
+        commander ! consumerToLastActive.nonEmpty
       } onComplete {
         case Success(_) =>
-        case Failure(e) =>
-          log.error(e, e.getMessage)
+        case Failure(e) => log.error(e, e.getMessage)
       }
 
-    case QueueEntity.Pull(_, prefetchCount, prefetchSize, autoAck) =>
+    case m @ QueueEntity.Pull(_, consumerTag, connectionId, channelId, prefetchCount, prefetchSize, autoAck) =>
       val commander = sender()
 
-      if (messageIds.nonEmpty) {
-        val maxCount = math.min(messageIds.length, prefetchCount)
-        log.debug(s"$id msgs: $messageIds, max fetching count: $maxCount")
+      if (isExclusive && this.connectionId != connectionId) {
+        log.error(s"$m: access exclusive queue from another connection")
+        commander ! Vector()
+      } else {
 
-        val now = System.currentTimeMillis
-        var msgIds = Vector[Long]()
-        var count = 0
-        var lastOffset = lastConsumed
-        var msgsBodySize = 0
-        val msgsItr = messageIds.iterator
-        while (msgsItr.hasNext && count < maxCount && msgsBodySize < prefetchSize) {
-          val msg = msgsItr.next()
-          val expired = queueMsgTtl.isDefined && msg.expired(now)
+        consumerTag foreach { tag =>
+          consumerToLastActive += (AMQConsumer.globalId(tag, connectionId, channelId) -> System.currentTimeMillis)
+        }
 
-          if (expired) {
-            count += 1
-            lastOffset = msg.offset
-            messageSharding ! MessageEntity.Unrefer(msg.id.toString)
-          } else {
-            msgsBodySize += msg.bodySize
-            if (msgsBodySize < prefetchSize) {
+        if (messageIds.nonEmpty) {
+          val maxCount = math.min(messageIds.length, prefetchCount)
+          log.debug(s"$id msgs: $messageIds, max fetching count: $maxCount")
+
+          val now = System.currentTimeMillis
+          var msgIds = Vector[Long]()
+          var count = 0
+          var lastOffset = lastConsumed
+          var msgsBodySize = 0
+          val msgsItr = messageIds.iterator
+          while (msgsItr.hasNext && count < maxCount && msgsBodySize < prefetchSize) {
+            val msg = msgsItr.next()
+            val expired = queueMsgTtl.isDefined && msg.expired(now)
+
+            if (expired) {
               count += 1
               lastOffset = msg.offset
-              msgIds :+= msg.id
+              messageSharding ! MessageEntity.Unrefer(msg.id.toString)
+            } else {
+              msgsBodySize += msg.bodySize
+              if (msgsBodySize < prefetchSize) {
+                count += 1
+                lastOffset = msg.offset
+                msgIds :+= msg.id
+              }
             }
           }
-        }
-        (msgIds, count)
+          (msgIds, count)
 
-        log.debug(s"$id msgIds: $count ${msgIds.mkString("(", ",", ")")}, lastConsumed: $lastConsumed, msgs left: ${messageIds.length}")
+          log.debug(s"$id msgIds: $count ${msgIds.mkString("(", ",", ")")}, lastConsumed: $lastConsumed, msgs left: ${messageIds.length}")
 
-        lastConsumed = lastOffset
-        messageIds = messageIds.drop(count)
+          lastConsumed = lastOffset
+          messageIds = messageIds.drop(count)
 
-        if (msgIds.nonEmpty) {
-          if (!autoAck) {
-            unacks ++= msgIds
-          }
+          if (msgIds.nonEmpty) {
+            if (!autoAck) {
+              unacks ++= msgIds
+            }
 
-          val persist = if (isDurable) {
-            if (autoAck) {
-              storeService.consumedQueueMessages(id, lastConsumed, consumerCount, isDurable, queueMsgTtl, Vector())
+            val persist = if (isDurable) {
+              if (autoAck) {
+                storeService.consumedQueueMessages(id, lastConsumed, Vector())
+              } else {
+                storeService.consumedQueueMessages(id, lastConsumed, msgIds)
+              }
             } else {
-              storeService.consumedQueueMessages(id, lastConsumed, consumerCount, isDurable, queueMsgTtl, msgIds)
+              Future.successful(())
+            }
+
+            persist map { _ =>
+              commander ! msgIds
+            } onComplete {
+              case Success(_) =>
+              case Failure(e) => log.error(e, e.getMessage)
             }
           } else {
-            Future.successful(())
-          }
-
-          persist map { _ =>
-            commander ! msgIds
-          } onComplete {
-            case Success(_) =>
-            case Failure(e) =>
-              log.error(e, e.getMessage)
+            commander ! Vector()
           }
         } else {
           commander ! Vector()
         }
-      } else {
-        commander ! Vector()
       }
 
     case QueueEntity.Acked(_, msgIds) =>
@@ -401,12 +420,12 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
     }
 
     val persist = if (isDurable) {
-      storeService.insertQueueMeta(id, lastConsumed, consumerCount, isDurable, queueMsgTtl)
+      storeService.insertQueueMeta(id, lastConsumed, consumerToLastActive.keySet, isDurable, queueMsgTtl)
     } else {
       Future.successful(())
     }
 
-    persist map { _ => QueueEntity.Statistics(existed, messageIds.length, consumerCount) }
+    persist map { _ => QueueEntity.Statistics(existed, messageIds.length, consumerToLastActive.size) }
   }
 
   private def delete(connectionId: Int, isForce: Boolean): Future[(Boolean, Int)] = {
