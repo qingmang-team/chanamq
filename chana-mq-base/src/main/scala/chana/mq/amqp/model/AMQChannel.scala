@@ -45,29 +45,54 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
    * for client use, meaning "all messages so far received".
    */
   private var deliveryTag = 1L
-  private var unackedDeliveryTagToMsgId = Map[Long, Long]()
+  private var unackedDeliveryTagToMsgId = Map[Long, (Long, AMQConsumer)]()
 
-  def nextDeliveryTags(msgIds: Vector[Long], autoAck: Boolean): Vector[Long] = {
-    val (tags, newTag) = msgIds.foldLeft((Vector[Long](), deliveryTag)) {
-      case ((tags, tag), msgId) =>
-        if (!autoAck) {
-          unackedDeliveryTagToMsgId += (tag -> msgId)
-        }
-        (tags :+ tag, tag + 1)
+  def nUnacks = unackedDeliveryTagToMsgId.size
+
+  /**
+   * @return generated channel specific delivery tags
+   */
+  def goingToDeliveryMsgs(msgIds: Vector[Long], consumer: AMQConsumer, autoAck: Boolean): Vector[Long] = {
+    msgIds.map { msgId =>
+      val tag = deliveryTag
+      if (!autoAck) {
+        consumer.nUnacks += 1
+        unackedDeliveryTagToMsgId += (tag -> (msgId, consumer))
+      }
+      deliveryTag += 1
+      tag
+    }
+  }
+
+  def ackDeliveryTag(deliveryTag: Long): Option[(String, Long)] = {
+    val queueAndMsgId = msgIdOfDeliveryTag(deliveryTag) map {
+      case (msgId, consumer) =>
+        consumer.nUnacks -= 1
+        (consumer.queue, msgId)
     }
 
-    deliveryTag = newTag
-    tags
+    unackedDeliveryTagToMsgId -= deliveryTag
+
+    queueAndMsgId
   }
 
-  def ackDeliveryTags(tags: Vector[Long]) {
+  def ackDeliveryTags(tags: collection.Set[Long]): collection.Set[(String, Long)] = {
+    val queueAndMsgIds = tags map { tag =>
+      msgIdOfDeliveryTag(tag) map {
+        case (msgId, consumer) =>
+          consumer.nUnacks -= 1
+          (consumer.queue, msgId)
+      }
+    }
+
     unackedDeliveryTagToMsgId --= tags
+
+    queueAndMsgIds.flatten
   }
 
-  def msgIdOfDeliveryTag(tag: Long) =
-    unackedDeliveryTagToMsgId.get(tag)
+  def msgIdOfDeliveryTag(tag: Long): Option[(Long, AMQConsumer)] = unackedDeliveryTagToMsgId.get(tag)
 
-  def ackMultipleTags(tag: Long): Set[Long] = {
+  def getMultipleTagsTill(tag: Long): Set[Long] = {
     var ackTags = Set[Long]()
 
     var acked = -1L
@@ -76,6 +101,7 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
       acked = unackedTags.next()
       ackTags += acked
     }
+
     ackTags
   }
 
