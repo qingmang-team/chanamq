@@ -34,6 +34,51 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
 
   var isOpen: Boolean = true
 
+  /**
+   * The server-assigned and channel-specific delivery tag
+   *
+   * The delivery tag is valid only within the channel from which the message was
+   * received. I.e. a client MUST NOT receive a message on one channel and then
+   * acknowledge it on another.
+   *
+   * The server MUST NOT use a zero value for delivery tags. Zero is reserved
+   * for client use, meaning "all messages so far received".
+   */
+  private var deliveryTag = 1L
+  private var unackedDeliveryTagToMsgId = Map[Long, Long]()
+
+  def nextDeliveryTags(msgIds: Vector[Long], autoAck: Boolean): Vector[Long] = {
+    val (tags, newTag) = msgIds.foldLeft((Vector[Long](), deliveryTag)) {
+      case ((tags, tag), msgId) =>
+        if (!autoAck) {
+          unackedDeliveryTagToMsgId += (tag -> msgId)
+        }
+        (tags :+ tag, tag + 1)
+    }
+
+    deliveryTag = newTag
+    tags
+  }
+
+  def ackDeliveryTags(tags: Vector[Long]) {
+    unackedDeliveryTagToMsgId --= tags
+  }
+
+  def msgIdOfDeliveryTag(tag: Long) =
+    unackedDeliveryTagToMsgId.get(tag)
+
+  def ackMultipleTags(tag: Long): Set[Long] = {
+    var ackTags = Set[Long]()
+
+    var acked = -1L
+    val unackedTags = unackedDeliveryTagToMsgId.keysIterator
+    while (unackedTags.hasNext && acked != tag) {
+      acked = unackedTags.next()
+      ackTags += acked
+    }
+    ackTags
+  }
+
   @throws(classOf[AlreadyClosedException])
   def ensureIsOpen() {
     if (!isOpen) {

@@ -388,6 +388,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             }
 
             log.debug(s"$id prefetchCount: $prefetchCount")
+
             if (prefetchCount > 0) {
               (queueSharding ? QueueEntity.Pull(consumer.queue, Some(consumer.tag), connection.id, consumer.channel.channelNumber, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
                 log.debug(s"$id pulled: $msgIds")
@@ -403,31 +404,32 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             case Failure(e) => log.error(e, e.getMessage)
           }
 
-          val callback = getAsyncCallback[mutable.Set[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { setOfChannelConsumerMsgs =>
-            val body = setOfChannelConsumerMsgs.foldLeft(ByteString.newBuilder) {
+          val callback = getAsyncCallback[mutable.Set[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { consumerAndMsgs =>
+            val body = consumerAndMsgs.foldLeft(ByteString.newBuilder) {
               case (acc, (consumer @ AMQConsumer(channel, consumerTag, queue, autoAck), msgIds, msgs)) =>
                 val nMsgs = msgIds.size
                 if (nMsgs > 0) log.info(s"$id delivered msgs: $nMsgs")
+
+                val deliveryTags = channel.nextDeliveryTags(msgIds, autoAck)
 
                 if (autoAck) {
                   // Unrefer should happen after message got. Unrefer could be async
                   msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
                 } else {
-                  msgIds foreach { msgId =>
+                  deliveryTags foreach { tag =>
                     consumer.nUnacks += 1
-                    consumer.unackedMessages += msgId
-                    unackedMessageToConsumer += (msgId -> consumer)
+                    unackedMessageToConsumer += (tag -> consumer)
                   }
                 }
 
-                msgs.foldLeft(acc) {
-                  case (acc, Some(Message(msgId, header, body, exchange, routingKey, ttl))) =>
-                    val method = Basic.Deliver(consumerTag, msgId, redelivered = false, exchange, routingKey)
+                (deliveryTags zip msgs).foldLeft(acc) {
+                  case (acc, (deliveryTag, Some(Message(msgId, header, body, exchange, routingKey, ttl)))) =>
+                    val method = Basic.Deliver(consumerTag, deliveryTag, redelivered = false, exchange, routingKey)
                     val command = AMQCommand(method, header, body)
                     val payload = channel.render(command)
 
                     acc ++= payload
-                  case (acc, None) =>
+                  case (acc, (_, None)) =>
                     acc
                 }
 
@@ -559,56 +561,41 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       }
 
       private def receivedAcks(acks: Vector[AMQCommand[Basic.Ack]], isLastCommand: Boolean) {
-        log.info(s"$id recv $acks")
+        log.debug(s"$id recv $acks")
+        val start = System.currentTimeMillis
 
-        val future = Future.sequence(acks.map(_.method) map {
-          case Basic.Ack(deliveryTag, multiple) =>
+        val consumerToAckTags = acks.foldLeft(Map[AMQConsumer, Vector[Long]]()) {
+          case (acc, AMQCommand(Basic.Ack(deliveryTag, multiple), _, _, _)) =>
             unackedMessageToConsumer.get(deliveryTag) match {
-              case Some(consumer) if !consumer.autoAck =>
+              case Some(consumer) =>
                 if (multiple) {
-                  val ackedMsgIds = new mutable.HashSet[Long]()
-
-                  val unackedMsgIds = consumer.unackedMessages.iterator
-                  var count = 0
-                  var acked = -1L
-                  while (unackedMsgIds.hasNext && acked != deliveryTag) {
-                    acked = unackedMsgIds.next()
-                    count += 1
-                    ackedMsgIds += acked
-                  }
-
-                  consumer.nUnacks -= count
-                  consumer.unackedMessages --= ackedMsgIds
-                  unackedMessageToConsumer --= ackedMsgIds
-                  log.info(s"unacked: ${consumer.tag} ${consumer.unackedMessages.size}")
-
-                  ackedMsgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
-                  (queueSharding ? QueueEntity.Acked(consumer.queue, ackedMsgIds.toList)).mapTo[Boolean]
+                  val ackedTags = consumer.channel.ackMultipleTags(deliveryTag)
+                  acc + (consumer -> (acc.getOrElse(consumer, Vector()) ++ ackedTags))
                 } else {
-                  consumer.nUnacks -= 1
-                  consumer.unackedMessages -= deliveryTag
-                  unackedMessageToConsumer -= deliveryTag
-                  log.info(s"unacked: ${consumer.tag} ${consumer.unackedMessages.size}")
-
-                  messageSharding ! MessageEntity.Unrefer(deliveryTag.toString)
-                  (queueSharding ? QueueEntity.Acked(consumer.queue, List(deliveryTag))).mapTo[Boolean]
+                  acc + (consumer -> (acc.getOrElse(consumer, Vector()) :+ deliveryTag))
                 }
-
-              case None =>
-                Future.successful(true)
+              case _ =>
+                acc
             }
-        }) andThen {
-          case Success(_) =>
-          case Failure(e) => log.error(e, e.getMessage)
         }
 
-        val callback = getAsyncCallback[Vector[Boolean]] { xs =>
-          if (isLastCommand) {
-            pushHeatbeatOrPendingOrMessagesOrPull()
-          }
+        consumerToAckTags map {
+          case (consumer, ackedTags) =>
+            consumer.nUnacks -= ackedTags.size
+            unackedMessageToConsumer --= ackedTags
+
+            val ackedMsgIds = ackedTags.map(consumer.channel.msgIdOfDeliveryTag).flatten
+            consumer.channel.ackDeliveryTags(ackedTags)
+
+            log.info(s"$id acked in ${System.currentTimeMillis - start}ms. unacked: ${consumer.nUnacks}")
+
+            ackedMsgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
+            queueSharding ! QueueEntity.Acked(consumer.queue, ackedMsgIds)
         }
 
-        future.foreach(callback.invoke)
+        if (isLastCommand) {
+          pushHeatbeatOrPendingOrMessagesOrPull()
+        }
       }
 
       private def receivedCommands(commands: Vector[AMQCommand[AMQMethod]], lastCommand: AMQCommand[AMQMethod]) {
@@ -1062,16 +1049,16 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               }
 
               val callback = getAsyncCallback[Vector[Option[Message]]] {
-                case Vector(Some(Message(deliveryId, header, body, exchange, routingKey, ttl))) =>
+                case Vector(Some(Message(msgId, header, body, exchange, routingKey, ttl))) =>
+                  val deliveryTag = channel.nextDeliveryTags(Vector(msgId), autoAck).head
                   if (autoAck) {
-                    messageSharding ! MessageEntity.Unrefer(deliveryId.toString)
+                    messageSharding ! MessageEntity.Unrefer(msgId.toString)
                   } else {
                     channel.basicGetConsumer.nUnacks += 1
-                    channel.basicGetConsumer.unackedMessages += deliveryId
-                    unackedMessageToConsumer += (deliveryId -> channel.basicGetConsumer)
+                    unackedMessageToConsumer += (deliveryTag -> channel.basicGetConsumer)
                   }
 
-                  val method = Basic.GetOk(deliveryId, redelivered = false, exchange, routingKey, 1)
+                  val method = Basic.GetOk(deliveryTag, redelivered = false, exchange, routingKey, 1)
                   val command = AMQCommand(method, header, body)
                   val resp = channel.render(command)
 

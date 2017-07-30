@@ -64,7 +64,7 @@ object QueueEntity {
   final case class IsDurable(id: String) extends Command
   final case class Push(id: String, msgs: Vector[Msg], connectionId: Int) extends Command
   final case class Pull(id: String, consumerTag: Option[String], connectionId: Int, channelId: Int, prefetchCount: Int, prefetchSize: Long, autoAck: Boolean) extends Command
-  final case class Acked(id: String, msgId: List[Long]) extends Command
+  final case class Acked(id: String, msgIds: Vector[Long]) extends Command
 
   final case class ConsumerStarted(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
   final case class ConsumerCancelled(id: String, tag: String, connectionId: Int, channelId: Int) extends Command

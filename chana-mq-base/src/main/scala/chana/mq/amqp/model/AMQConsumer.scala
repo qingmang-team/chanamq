@@ -15,6 +15,5 @@ final case class AMQConsumer(channel: AMQChannel, tag: String, queue: String, au
 
   override def hashCode = tag.hashCode
 
-  val unackedMessages = if (autoAck) AMQConsumer.EmptyMsgSet else new mutable.HashSet[Long]()
   var nUnacks = 0
 }
