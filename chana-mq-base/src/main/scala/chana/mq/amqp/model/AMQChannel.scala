@@ -12,7 +12,7 @@ object AMQChannel {
   case object Transaction extends Mode
   case object Confirm extends Mode
 }
-class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
+class AMQChannel(val connection: AMQConnection, val id: Int) {
   private type AMQMethod = AMQClass#Method
 
   var mode: AMQChannel.Mode = AMQChannel.Normal
@@ -133,46 +133,6 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
   def ensureIsOpen() {
     if (!isOpen) {
       throw new AlreadyClosedException("Channel or Connection already closed")
-    }
-  }
-
-  @throws(classOf[IOException])
-  def render(command: AMQCommand[_ <: AMQMethod]): ByteString = {
-    ensureIsOpen()
-    // TODO write to outlet of FrameHandler directly
-    val buf = ByteString.newBuilder
-    val os = new DataOutputStream(buf.asOutputStream)
-    render(command, os)
-    os.flush()
-    buf.result
-  }
-
-  @throws(classOf[IOException])
-  private def render(command: AMQCommand[_ <: AMQMethod], os: DataOutputStream) {
-    val methodFrame = command.method.toFrame(channelNumber)
-    methodFrame.writeTo(os)
-    if (command.method.hasContent) {
-      command match {
-        case AMQCommand(method, Some(contentHeader), Some(contentBody), _) =>
-          val headerFrame = contentHeader.toFrame(channelNumber, contentBody.length)
-          headerFrame.writeTo(os)
-
-          val frameMax = connection.frameMax
-          val bodyPayloadMax = if (frameMax == 0) contentBody.length else frameMax - Frame.NON_BODY_SIZE
-
-          var offset = 0
-          while (offset < contentBody.length) {
-            val remaining = contentBody.length - offset
-
-            val fragmentLength = if (remaining < bodyPayloadMax) remaining else bodyPayloadMax
-            val bodyFrame = Frame.fromBodyFragment(channelNumber, contentBody, offset, fragmentLength)
-            bodyFrame.writeTo(os)
-            offset += bodyPayloadMax
-          }
-
-        case _ =>
-          throw new RuntimeException(s"$command method has content, but with None header or None body")
-      }
     }
   }
 }

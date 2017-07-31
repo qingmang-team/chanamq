@@ -1,16 +1,12 @@
 package chana.mq.amqp.model
 
+import akka.util.ByteString
 import chana.mq.amqp.method.AMQClass
+import java.io.DataOutputStream
+import java.io.IOException
 
-final case class AMQCommand[T <: AMQClass#Method](method: T, contentHeader: Option[BasicProperties] = None, contentBody: Option[Array[Byte]] = None, channelId: Int = -1) {
+final case class AMQCommand[T <: AMQClass#Method](channel: AMQChannel, method: T, contentHeader: Option[BasicProperties] = None, contentBody: Option[Array[Byte]] = None) {
   assert(method.hasContent && contentHeader.isDefined && contentBody.isDefined || !method.hasContent, s"$this should be: method.hasContent && contentHeader.isDefined && contentBody.isDefined || !method.hasContent ")
-
-  private var _channel: AMQChannel = _
-  def channel = _channel
-  def channel_=(channe: AMQChannel): this.type = {
-    this._channel = channel
-    this
-  }
 
   def toStringWithBody: String = {
     val sb = new StringBuilder()
@@ -28,5 +24,43 @@ final case class AMQCommand[T <: AMQClass#Method](method: T, contentHeader: Opti
 
     sb.append(body).append(')')
     sb.toString
+  }
+
+  @throws(classOf[IOException])
+  def render: ByteString = {
+    val buf = ByteString.newBuilder
+    val os = new DataOutputStream(buf.asOutputStream)
+    render(os)
+    os.flush()
+    buf.result
+  }
+
+  @throws(classOf[IOException])
+  private def render(os: DataOutputStream) {
+    val methodFrame = method.toFrame(channel.id)
+    methodFrame.writeTo(os)
+    if (method.hasContent) {
+      (contentHeader, contentBody) match {
+        case (Some(header), Some(body)) =>
+          val headerFrame = header.toFrame(channel.id, body.length)
+          headerFrame.writeTo(os)
+
+          val frameMax = channel.connection.frameMax
+          val bodyPayloadMax = if (frameMax == 0) body.length else frameMax - Frame.NON_BODY_SIZE
+
+          var offset = 0
+          while (offset < body.length) {
+            val remaining = body.length - offset
+
+            val fragmentLength = if (remaining < bodyPayloadMax) remaining else bodyPayloadMax
+            val bodyFrame = Frame.fromBodyFragment(channel.id, body, offset, fragmentLength)
+            bodyFrame.writeTo(os)
+            offset += bodyPayloadMax
+          }
+
+        case _ =>
+          throw new RuntimeException(s"$this method has content, but with None header or None body")
+      }
+    }
   }
 }

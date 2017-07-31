@@ -16,6 +16,17 @@ object AMQConnection {
 class AMQConnection() {
   lazy val id = System.identityHashCode(this)
 
+  val channel0 = new AMQChannel(this, 0)
+  var channels = Map[Int, AMQChannel]()
+
+  def getExistedChannel(channelId: Int): Option[AMQChannel] = {
+    if (channelId == 0) {
+      Some(channel0)
+    } else {
+      channels.get(channelId)
+    }
+  }
+
   /**
    * The maximum total number of channels that the client will use per connection.
    *

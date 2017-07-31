@@ -21,7 +21,10 @@ package chana.mq.amqp.engine
 
 import akka.util.ByteString
 import chana.mq.amqp.method.AMQClass
+import chana.mq.amqp.method.Channel
+import chana.mq.amqp.model.AMQChannel
 import chana.mq.amqp.model.AMQCommand
+import chana.mq.amqp.model.AMQConnection
 import chana.mq.amqp.model.AMQContentHeader
 import chana.mq.amqp.model.BasicProperties
 import chana.mq.amqp.model.Frame
@@ -38,13 +41,13 @@ object CommandAssembler {
     override def toString = s"Error on received frame: $frame, $reason"
   }
 }
-final class CommandAssembler() {
+final class CommandAssembler(connection: AMQConnection) {
   import CommandAssembler._
 
   private var method: AMQClass#Method = _
   private var contentHeader: BasicProperties = _
   private var body = ByteString.newBuilder
-  private var channelId: Int = _
+  private var channel: AMQChannel = _
 
   private var nBodyBytesRemaining = 0L
   private var state: State = ExpectingMethod
@@ -64,14 +67,28 @@ final class CommandAssembler() {
   private def receivedMethodFrame(frame: Frame): State = {
     frame match {
       case Frame(Frame.METHOD, channel, payload) =>
-        channelId = frame.channel
-        method = AMQClass.readFrom(payload)
-        if (method.hasContent)
-          ExpectingHeader
-        else
-          Ok(AMQCommand(method, None, None, channelId))
+        this.method = AMQClass.readFrom(payload)
+
+        val channelId = frame.channel
+        connection.getExistedChannel(channelId) match {
+          case Some(channel) =>
+            this.channel = channel
+            if (method.hasContent) {
+              ExpectingHeader
+            } else {
+              Ok(AMQCommand(channel, method, None, None))
+            }
+          case None =>
+            if (method.isInstanceOf[Channel.Open]) {
+              // special case for Channel.Open, will check new channel's validation later on 
+              Ok(AMQCommand(new AMQChannel(connection, channelId), method, None, None))
+            } else {
+              Error(frame, "channelId does not exist")
+            }
+        }
+
       case _ =>
-        Error(frame, s"expected type Frame.METHOD")
+        Error(frame, "expected type Frame.METHOD")
     }
   }
 
@@ -84,10 +101,10 @@ final class CommandAssembler() {
         if (nBodyBytesRemaining > 0) {
           ExpectingBody
         } else {
-          Ok(AMQCommand(method, Some(contentHeader), Some(body.result.toArray), channelId))
+          Ok(AMQCommand(channel, method, Some(contentHeader), Some(body.result.toArray)))
         }
       case _ =>
-        Error(frame, s"expected type Frame.HEADER")
+        Error(frame, "expected type Frame.HEADER")
     }
   }
 
@@ -100,7 +117,7 @@ final class CommandAssembler() {
           if (nBodyBytesRemaining > 0) {
             ExpectingBody
           } else if (nBodyBytesRemaining == 0) {
-            Ok(AMQCommand(method, Some(contentHeader), Some(body.result.toArray), channelId))
+            Ok(AMQCommand(channel, method, Some(contentHeader), Some(body.result.toArray)))
           } else {
             Error(frame, s"nBodyBytesRemaining $nBodyBytesRemaining < 0")
           }
@@ -108,7 +125,7 @@ final class CommandAssembler() {
           state
         }
       case _ =>
-        Error(frame, s"expected type Frame.BODY")
+        Error(frame, "expected type Frame.BODY")
     }
   }
 }
