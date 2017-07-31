@@ -45,7 +45,11 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
    * for client use, meaning "all messages so far received".
    */
   private var deliveryTag = 1L
-  private var unackedDeliveryTagToMsgId = Map[Long, (Long, AMQConsumer)]()
+
+  /**
+   * Use LinkedHashMap to keep the original inserting order
+   */
+  private val unackedDeliveryTagToMsgId = mutable.LinkedHashMap[Long, (Long, AMQConsumer)]()
 
   def nUnacks = unackedDeliveryTagToMsgId.size
 
@@ -90,19 +94,22 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
     queueAndMsgIds.flatten
   }
 
-  def msgIdOfDeliveryTag(tag: Long): Option[(Long, AMQConsumer)] = unackedDeliveryTagToMsgId.get(tag)
+  def msgIdOfDeliveryTag(tag: Long): Option[(Long, AMQConsumer)] =
+    unackedDeliveryTagToMsgId.get(tag)
 
-  def getMultipleTagsTill(tag: Long): Set[Long] = {
-    var ackTags = Set[Long]()
-
-    var acked = -1L
+  def getMultipleTagsTill(diliveryTag: Long): collection.Set[Long] = {
+    var tags = Set[Long]()
+    var break = false
     val unackedTags = unackedDeliveryTagToMsgId.keysIterator
-    while (unackedTags.hasNext && acked != tag) {
-      acked = unackedTags.next()
-      ackTags += acked
+    while (unackedTags.hasNext && !break) {
+      val tag = unackedTags.next()
+      if (tag <= diliveryTag) {
+        tags += tag
+      } else {
+        break = true
+      }
     }
-
-    ackTags
+    tags
   }
 
   @throws(classOf[AlreadyClosedException])

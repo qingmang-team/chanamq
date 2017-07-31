@@ -560,9 +560,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             channels.get(channelId) match {
               case Some(channel) =>
                 if (multiple) {
-                  val ackedTags = channel.getMultipleTagsTill(deliveryTag)
+                  val ackTags = channel.getMultipleTagsTill(deliveryTag)
 
-                  channel.ackDeliveryTags(ackedTags) foreach {
+                  channel.ackDeliveryTags(ackTags) foreach {
                     case (queue, msgId) => queueToAckMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
                   }
                 } else {
