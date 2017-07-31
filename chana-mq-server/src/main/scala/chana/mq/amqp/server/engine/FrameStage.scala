@@ -136,15 +136,29 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       val callback = getAsyncCallback[Iterable[Boolean]] { _ =>
         val method = Connection.Close(errorCode, message, causeMethodClassId, causeMethodId)
         val command = AMQCommand(method)
-        val resp = channel0.render(command)
+        val payload = channel0.render(command)
 
-        push(out, resp)
+        push(out, payload)
 
         // do not call completeStage() here, the client may send back CloseOk or sth? 
         // and cause error: Bad frame end marker: 0
       }
 
       future.foreach(callback.invoke)
+    }
+
+    private def pushConnectionBlocked(channel: AMQChannel, reason: String) {
+      val command = AMQCommand(Connection.Blocked(reason))
+      val payload = channel.render(command)
+
+      push(out, payload)
+    }
+
+    private def pushConnectionUnblocked(channel: AMQChannel) {
+      val command = AMQCommand(Connection.Unblocked)
+      val payload = channel.render(command)
+
+      push(out, payload)
     }
 
     private def completeAndCloseAllChannels(): Future[Iterable[Boolean]] = {
@@ -303,9 +317,25 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                   commandAssembler.onReceive(frame) match {
                     case CommandAssembler.Ok(command) =>
                       command.method match {
-                        case _: Basic.Ack     => ackCommands :+= command.asInstanceOf[AMQCommand[Basic.Ack]]
-                        case _: Basic.Publish => publishCommands :+= command.asInstanceOf[AMQCommand[Basic.Publish]]
-                        case _                => otherCommands :+= command
+                        case _: Basic.Ack =>
+                          channels.get(command.channelId) match {
+                            case Some(channel) =>
+                              ackCommands :+= (command.channel = channel).asInstanceOf[AMQCommand[Basic.Ack]]
+                            case None =>
+                              pushConnectionClose(command.channelId, ErrorCodes.CHANNEL_ERROR, s"Channel ${command.channelId} does not exist", command.method.classId, command.method.id)
+                              shouldClose = true
+                          }
+
+                        case _: Basic.Publish =>
+                          channels.get(command.channelId) match {
+                            case Some(channel) =>
+                              publishCommands :+= (command.channel = channel).asInstanceOf[AMQCommand[Basic.Publish]]
+                            case None =>
+                              pushConnectionClose(command.channelId, ErrorCodes.CHANNEL_ERROR, s"Channel ${command.channelId} does not exist", command.method.classId, command.method.id)
+                              shouldClose = true
+                          }
+
+                        case _ => otherCommands :+= command
                       }
 
                       lastCommandOnThisPush = Some(command)
@@ -444,13 +474,17 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         }
       }
 
+      /**
+       * Section 4.7 of the AMQP 0-9-1 core specification explains the
+       * conditions under which ordering is guaranteed: messages published
+       * in one channel, passing through one exchange and one queue and
+       * one outgoing channel will be received in the same order that
+       * they were sent.
+       */
       private def receivedPublishes(publishes: Vector[AMQCommand[Basic.Publish]], isLastCommand: Boolean) {
-        // Section 4.7 of the AMQP 0-9-1 core specification explains the 
-        // conditions under which ordering is guaranteed: messages published
-        // in one channel, passing through one exchange and one queue and
-        // one outgoing channel will be received in the same order that
-        // they were sent.  
         var msgIdToCommand = Map[Long, AMQCommand[Basic.Publish]]()
+        var msgIdToConfirmNo = Map[Long, Long]()
+        var channelToConfirmedNo = mutable.Map[AMQChannel, mutable.LinkedHashSet[Long]]()
         val future = Future.sequence(publishes.groupBy(x => x.method.exchange) map {
           case (exchange, commands) =>
             val msgIds = idService.nextIds(commands.size)
@@ -458,6 +492,16 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             Future.sequence((msgIds zip commands) map {
               case (msgId, command @ AMQCommand(publish, header, body, channelId)) =>
                 log.debug(s"Got $msgId, ${try { new String(body.getOrElse(Array())) } catch { case ex: Throwable => "" }}")
+
+                val channel = command.channel
+                channel.isDoingPublishing = true
+                channel.mode match {
+                  case AMQChannel.Confirm =>
+                    val confirmNo = channel.nextConfirmNumber()
+                    msgIdToConfirmNo += (msgId -> confirmNo)
+                    channelToConfirmedNo.getOrElseUpdate(channel, new mutable.LinkedHashSet[Long]()) += confirmNo
+                  case _ =>
+                }
 
                 val isPersist = header match {
                   case None => false
@@ -495,56 +539,94 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           case Failure(e) => log.error(e, e.getMessage)
         }
 
-        val callback = getAsyncCallback[immutable.Iterable[Vector[(Long, Boolean, Boolean)]]] {
-          case exchangesToResults =>
-            val (mandatoryReturns, immediateReturns) = exchangesToResults.flatten.foldLeft((Vector[AMQCommand[Basic.Publish]](), Vector[AMQCommand[Basic.Publish]]())) {
-              case ((mandatoryReturns, immediateReturns), (msgId, isNonRouted, isNonDeliverable)) =>
-                msgIdToCommand.get(msgId) match {
-                  case Some(command) =>
-                    if (command.method.immediate && isNonDeliverable) {
-                      (mandatoryReturns, immediateReturns :+ command)
-                    } else {
-                      if (command.method.mandatory && isNonRouted) {
-                        (mandatoryReturns :+ command, immediateReturns)
-                      } else {
-                        (mandatoryReturns, immediateReturns)
-                      }
+        val callback = getAsyncCallback[immutable.Iterable[Vector[(Long, Boolean, Boolean)]]] { publishResults =>
+
+          val (mandatoryReturns, immediateReturns) = publishResults.flatten.foldLeft((Vector[AMQCommand[Basic.Publish]](), Vector[AMQCommand[Basic.Publish]]())) {
+            case ((mandatoryReturns, immediateReturns), (msgId, isNonRouted, isNonDeliverable)) =>
+              msgIdToCommand.get(msgId) match {
+                case Some(command) =>
+                  val channel = command.channel
+
+                  if (command.method.immediate && isNonDeliverable) {
+                    channel.mode match {
+                      case AMQChannel.Confirm =>
+                        msgIdToConfirmNo.get(msgId) foreach { confirmNo =>
+                          channelToConfirmedNo.get(channel) foreach { confirmNos => confirmNos -= confirmNo }
+                        }
+                      case _ =>
                     }
-                  case None => // this should not happen
-                    (mandatoryReturns, immediateReturns)
-                }
-            }
 
-            payloadPendingToPush = mandatoryReturns.foldLeft(ByteString.newBuilder) {
-              case (acc, AMQCommand(Basic.Publish(_, exchange, routingKey, _, _), header, body, channelId)) =>
-                channels.get(channelId) match {
-                  case Some(channel) =>
-                    val command = AMQCommand(Basic.Return(ErrorCodes.NO_ROUTE, ErrorCodes.noRoute, exchange, routingKey), header, body)
-                    val payload = channel.render(command)
-                    acc ++= payload
-                  case None =>
-                    acc
-                }
-            }
+                    (mandatoryReturns, immediateReturns :+ command)
+                  } else {
+                    if (command.method.mandatory && isNonRouted) {
+                      channel.mode match {
+                        case AMQChannel.Confirm =>
+                          msgIdToConfirmNo.get(msgId) foreach { confirmNo =>
+                            channelToConfirmedNo.get(channel) foreach { confirmNos => confirmNos -= confirmNo }
+                          }
+                        case _ =>
+                      }
 
-            payloadPendingToPush = immediateReturns.foldLeft(payloadPendingToPush) {
-              case (acc, AMQCommand(Basic.Publish(_, exchange, routingKey, _, _), header, body, channelId)) =>
-                channels.get(channelId) match {
-                  case Some(channel) =>
-                    val command = AMQCommand(Basic.Return(ErrorCodes.NO_CONSUMERS, ErrorCodes.noConsumers, exchange, routingKey), header, body)
-                    val payload = channel.render(command)
-                    acc ++= payload
-                  case None =>
-                    acc
-                }
-            }
+                      (mandatoryReturns :+ command, immediateReturns)
+                    } else {
 
-            // if not isLastCommand, means we are still under same onPush (
-            // received multiple commands on one push), we should not push 
-            // or pull on port until isLastCommand.
-            if (isLastCommand) {
-              pushHeatbeatOrPendingOrMessagesOrPull()
-            }
+                      (mandatoryReturns, immediateReturns)
+                    }
+                  }
+
+                case None => // this should not happen
+                  (mandatoryReturns, immediateReturns)
+              }
+          }
+
+          payloadPendingToPush = mandatoryReturns.foldLeft(ByteString.newBuilder) {
+            case (acc, pubCommand @ AMQCommand(Basic.Publish(_, exchange, routingKey, _, _), header, body, channelId)) =>
+              val command = AMQCommand(Basic.Return(ErrorCodes.NO_ROUTE, ErrorCodes.noRoute, exchange, routingKey), header, body)
+              val payload = pubCommand.channel.render(command)
+              acc ++= payload
+          }
+
+          payloadPendingToPush = immediateReturns.foldLeft(payloadPendingToPush) {
+            case (acc, pubCommand @ AMQCommand(Basic.Publish(_, exchange, routingKey, _, _), header, body, channelId)) =>
+              val command = AMQCommand(Basic.Return(ErrorCodes.NO_CONSUMERS, ErrorCodes.noConsumers, exchange, routingKey), header, body)
+              val payload = pubCommand.channel.render(command)
+              acc ++= payload
+          }
+
+          channelToConfirmedNo foreach {
+            case (channel, confirmNos) =>
+              var confirmed = Vector[(Long, Boolean)]()
+              val ns = confirmNos.iterator
+              var n = 0L
+
+              while (ns.hasNext) {
+                val nx = ns.next()
+                if (n == 0) {
+                  confirmed :+= (nx, false)
+                } else if (nx - n == 1) {
+                  confirmed = confirmed.dropRight(1)
+                  confirmed :+= (nx, true)
+                } else {
+                  confirmed :+= (nx, false)
+                }
+
+                n = nx
+              }
+
+              payloadPendingToPush = confirmed.foldLeft(payloadPendingToPush) {
+                case (acc, (n, multiple)) =>
+                  val command = AMQCommand(Basic.Ack(n, multiple))
+                  val payload = channel.render(command)
+                  acc ++= payload
+              }
+          }
+
+          // if not isLastCommand, means we are still under same onPush (
+          // received multiple commands on one push), we should not push 
+          // or pull on port until isLastCommand.
+          if (isLastCommand) {
+            pushHeatbeatOrPendingOrMessagesOrPull()
+          }
         }
 
         future.foreach(callback.invoke)
@@ -556,21 +638,18 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
         val queueToAckMsgIds = mutable.Map[String, mutable.Set[Long]]()
         acks foreach {
-          case AMQCommand(Basic.Ack(deliveryTag, multiple), _, _, channelId) =>
-            channels.get(channelId) match {
-              case Some(channel) =>
-                if (multiple) {
-                  val ackTags = channel.getMultipleTagsTill(deliveryTag)
+          case command @ AMQCommand(Basic.Ack(deliveryTag, multiple), _, _, channelId) =>
+            val channel = command.channel
+            if (multiple) {
+              val ackTags = channel.getMultipleTagsTill(deliveryTag)
 
-                  channel.ackDeliveryTags(ackTags) foreach {
-                    case (queue, msgId) => queueToAckMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
-                  }
-                } else {
-                  channel.ackDeliveryTag(deliveryTag) foreach {
-                    case (queue, msgId) => queueToAckMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
-                  }
-                }
-              case None =>
+              channel.ackDeliveryTags(ackTags) foreach {
+                case (queue, msgId) => queueToAckMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
+              }
+            } else {
+              channel.ackDeliveryTag(deliveryTag) foreach {
+                case (queue, msgId) => queueToAckMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
+              }
             }
         }
 
@@ -1111,7 +1190,20 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       private def receivedConfirmMethod(channelId: Int, method: AMQMethod, isLastCommand: Boolean) {
         method match {
           case Confirm.Select(nowait) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            withChannel(channelId, method) { channel =>
+              channel.mode match {
+                case AMQChannel.Transaction =>
+                  pushConnectionClose(channelId, ErrorCodes.NOT_ALLOWED, s"The channel $channelId is already in transactional mode, cannot be put in confirm mode", method.classId, method.id)
+                case AMQChannel.Normal | AMQChannel.Confirm =>
+                  channel.mode = AMQChannel.Confirm
+
+                  val command = AMQCommand(Confirm.SelectOk)
+                  val payload = channel.render(command)
+                  push(out, payload)
+
+                  log.info(s"$id channel $channelId is put in confirm mode")
+              }
+            }
         }
       }
 

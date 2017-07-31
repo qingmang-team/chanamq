@@ -5,6 +5,13 @@ import chana.mq.amqp.method.AMQClass
 final case class AMQCommand[T <: AMQClass#Method](method: T, contentHeader: Option[BasicProperties] = None, contentBody: Option[Array[Byte]] = None, channelId: Int = -1) {
   assert(method.hasContent && contentHeader.isDefined && contentBody.isDefined || !method.hasContent, s"$this should be: method.hasContent && contentHeader.isDefined && contentBody.isDefined || !method.hasContent ")
 
+  private var _channel: AMQChannel = _
+  def channel = _channel
+  def channel_=(channe: AMQChannel): this.type = {
+    this._channel = channel
+    this
+  }
+
   def toStringWithBody: String = {
     val sb = new StringBuilder()
     sb.append("AMQCommand(")

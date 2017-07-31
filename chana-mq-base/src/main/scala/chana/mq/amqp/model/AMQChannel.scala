@@ -6,8 +6,25 @@ import java.io.DataOutputStream
 import java.io.IOException
 import scala.collection.mutable
 
+object AMQChannel {
+  sealed trait Mode
+  case object Normal extends Mode
+  case object Transaction extends Mode
+  case object Confirm extends Mode
+}
 class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
   private type AMQMethod = AMQClass#Method
+
+  var mode: AMQChannel.Mode = AMQChannel.Normal
+
+  var isDoingPublishing = false
+
+  private var confirmNumber = 1L
+  def nextConfirmNumber() = {
+    val n = confirmNumber
+    confirmNumber += 1
+    n
+  }
 
   val consumers = new mutable.Queue[AMQConsumer]()
 
@@ -120,12 +137,12 @@ class AMQChannel(val connection: AMQConnection, val channelNumber: Int) {
   }
 
   @throws(classOf[IOException])
-  def render(c: AMQCommand[_ <: AMQMethod]): ByteString = {
+  def render(command: AMQCommand[_ <: AMQMethod]): ByteString = {
     ensureIsOpen()
     // TODO write to outlet of FrameHandler directly
     val buf = ByteString.newBuilder
     val os = new DataOutputStream(buf.asOutputStream)
-    render(c, os)
+    render(command, os)
     os.flush()
     buf.result
   }
