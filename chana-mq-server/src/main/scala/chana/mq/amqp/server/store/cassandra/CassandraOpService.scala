@@ -177,7 +177,8 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   val deleteQueueMetaStmt = session.prepare("DELETE FROM queue_metas WHERE id = ?;")
   val selectQueueMetaStmt = session.prepare("SELECT * FROM queue_metas WHERE id = ?;")
 
-  val insertQueueUnackStmt = session.prepare("INSERT INTO queue_unacks (id, msgid) VALUES (?, ?);")
+  val insertQueueUnackStmt = session.prepare("INSERT INTO queue_unacks (id, offset, msgid, size) VALUES (?, ?, ?, ?);")
+  val insertQueueUnackTtlStmt = session.prepare("INSERT INTO queue_unacks (id, offset, msgid, size) VALUES (?, ?, ?, ?) USING TTL ?;")
   val deleteQueueUnackStmt = session.prepare("DELETE FROM queue_unacks WHERE id = ? AND msgid = ?;")
   val deleteQueueUnacksStmt = session.prepare("DELETE FROM queue_unacks WHERE id = ?;")
   val selectQueueUnackStmt = session.prepare("SELECT * FROM queue_unacks WHERE id = ?;")
@@ -226,14 +227,30 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   private def _selectQueueUnack(id: String) = selectQueueUnackStmt.bind(id)
   private def _deleteQueueUnack(id: String, msgId: Long) = deleteQueueUnackStmt.bind(id, msgId.asInstanceOf[AnyRef])
   private def _deleteQueueUnacks(id: String) = deleteQueueUnacksStmt.bind(id)
-  private def _insertQueueUnack(id: String, msgId: Long) = insertQueueUnackStmt.bind(id, msgId.asInstanceOf[AnyRef])
+  private def _insertQueueUnack(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]) = {
+    val bs = if (ttl.isDefined) {
+      new BoundStatement(insertQueueUnackTtlStmt)
+    } else {
+      new BoundStatement(insertQueueUnackStmt)
+    }
 
+    bs.setString(0, id)
+    bs.setLong(1, offset)
+    bs.setLong(2, msgId)
+    bs.setInt(3, size)
+
+    ttl foreach { x =>
+      bs.setInt(4, (x / 1000.0).toInt)
+    }
+    bs
+  }
   // --- queue_deleted
 
   val insertQueueMsgDeletedStmt = session.prepare("INSERT INTO queues_deleted (id, offset, msgid, size) VALUES (?, ?, ?, ?);")
   val insertQueueMsgDeletedTtlStmt = session.prepare("INSERT INTO queues_deleted (id, offset, msgid, size) VALUES (?, ?, ?, ?) USING TTL ?;")
   val insertQueueMetaDeletedStmt = session.prepare("INSERT INTO queue_metas_deleted (id, lconsumed, nconsumer, durable) VALUES (?, ?, ?, ?);")
-  val insertQueueUnackDeletedStmt = session.prepare("INSERT INTO queue_unacks_deleted (id, msgid) VALUES (?, ?);")
+  val insertQueueUnackDeletedStmt = session.prepare("INSERT INTO queue_unacks_deleted (id, offset, msgid, size) VALUES (?, ?, ?, ?);")
+  val insertQueueUnackDeletedTtlStmt = session.prepare("INSERT INTO queue_unacks_deleted (id, offset, msgid, size) VALUES (?, ?, ?, ?) USING TTL ?;")
 
   private def _insertQueueMsgDeleted(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]) = {
     val bs = if (ttl.isDefined) {
@@ -267,7 +284,24 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
     bs
   }
-  private def _insertQueueUnackDeleted(id: String, msgId: Long) = insertQueueUnackDeletedStmt.bind(id, msgId.asInstanceOf[AnyRef])
+  private def _insertQueueUnackDeleted(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]) = {
+    val bs = if (ttl.isDefined) {
+      new BoundStatement(insertQueueUnackDeletedTtlStmt)
+    } else {
+      new BoundStatement(insertQueueUnackDeletedStmt)
+    }
+
+    bs.setString(0, id)
+    bs.setLong(1, offset)
+    bs.setLong(2, msgId)
+    bs.setInt(3, size)
+
+    ttl foreach { x =>
+      bs.setInt(4, (x / 1000.0).toInt)
+    }
+
+    bs
+  }
 
   // --- exchange
 
@@ -414,20 +448,24 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   def insertQueueMsg(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]) = {
     val start = System.currentTimeMillis
     execute(_insertQueueMsg(id, offset, msgId, size, ttl)) map (_ => ()) andThen {
-      case Success(_) => log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(e) => log.error(e, s"Failed to insert queue of $id")
+      case Success(_) => log.info(s"Inserted queue msg of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert queue msg of $id")
     }
   }
 
   def deleteQueueMsgs(id: String) = {
     val start = System.currentTimeMillis
     execute(_deleteQueueMsg(id)) map (_ => ()) andThen {
-      case Success(_) => log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(e) => log.error(e, s"Failed to insert queue of $id")
+      case Success(_) => log.info(s"Deleted queue of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete queue of $id")
     }
   }
 
-  def consumedQueueMessages(id: String, lastConsumed: Long, unacks: Vector[Long]) = {
+  def insertLastConsumed(id: String, lastConsumed: Long) = {
+    execute(_insertQueueMetaLastConsumed(id, lastConsumed)) map (_ => ())
+  }
+
+  def consumedQueueMessages(id: String, lastConsumed: Long, unacks: Iterable[Msg]) = {
     val start = System.currentTimeMillis
     if (unacks.isEmpty) {
       Future.sequence(List(
@@ -438,11 +476,13 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
       Future.sequence(List(
         execute(_insertQueueMetaLastConsumed(id, lastConsumed)),
         execute(_deleteQueueMsgBeforeOffset(id, lastConsumed)),
-        Future.sequence(unacks map { msgId => execute(_insertQueueUnack(id, msgId)) })
+        Future.sequence(unacks map {
+          case Msg(offset, msgId, bodySize, ttl) => execute(_insertQueueUnack(id, offset, msgId, bodySize, ttl))
+        })
       )) map (_ => ())
     } andThen {
-      case Success(_) => log.info(s"Inserted queue of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(e) => log.error(e, s"Failed to insert queue of $id")
+      case Success(_) => log.info(s"Consumed queue messages of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to Consumed queue messages of $id")
     }
   }
 
@@ -452,12 +492,16 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
       case Some((lastConsumed, consumers, isDurable, queueMsgTtl)) =>
         log.debug(s"$lastConsumed, $consumers, $isDurable")
         execute(_selectQueueUnack(id)) map { rs =>
-          var unacks = Vector[Long]()
+          val now = System.currentTimeMillis
+          var unacks = Vector[Msg]()
           val raws = rs.iterator
           while (raws.hasNext) {
             val raw = raws.next()
+            val offset = raw.getLong("offset")
             val msgId = raw.getLong("msgid")
-            unacks :+= msgId
+            val size = raw.getInt("size")
+            val expireTime = if (raw.isNull("TTL(msgid)")) None else Some(now + raw.getInt("TTL(msgid)") * 1000L)
+            unacks :+= Msg(msgId, offset, size, expireTime)
           }
           unacks
         } flatMap { unacks =>
@@ -467,10 +511,10 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
             val raws = rs.iterator
             while (raws.hasNext) {
               val raw = raws.next()
-              val msgId = raw.getLong("msgid")
               val offset = raw.getLong("offset")
+              val msgId = raw.getLong("msgid")
               val size = raw.getInt("size")
-              val expireTime = if (raw.isNull("TTL(msgid)")) None else Some(now + raw.getInt("TTL(msgid)"))
+              val expireTime = if (raw.isNull("TTL(msgid)")) None else Some(now + raw.getInt("TTL(msgid)") * 1000L)
               msgs :+= Msg(msgId, offset, size, expireTime)
             }
             log.debug(s"$msgs")
@@ -504,8 +548,11 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
             val raws = rs.iterator
             while (raws.hasNext) {
               val raw = raws.next()
+              val offset = raw.getLong("offset")
               val msgId = raw.getLong("msgid")
-              unacks += execute(_insertQueueUnackDeleted(id, msgId)).map(_ => ())
+              val size = raw.getInt("size")
+              val ttl = if (raw.isNull("TTL(msgid)")) None else Some(raw.getInt("TTL(msgid)") * 1000L)
+              unacks += execute(_insertQueueUnackDeleted(id, offset, msgId, size, ttl)).map(_ => ())
             }
             Future.sequence(unacks)
           } flatMap { x =>
@@ -549,13 +596,11 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     }
   }
 
-  def insertQueueUnacks(id: String, msgIds: List[Long]) = {
+  def insertQueueUnack(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]) = {
     val start = System.currentTimeMillis
-    Future.sequence(msgIds map { msgId =>
-      execute(_insertQueueUnack(id, msgId))
-    }) map (_ => ()) andThen {
-      case Success(_) => log.info(s"Inserted unacks of $id in ${System.currentTimeMillis - start}ms")
-      case Failure(e) => log.error(e, s"Failed to insert unacks of $id")
+    execute(_insertQueueUnack(id, offset, msgId, size, ttl)) map (_ => ()) andThen {
+      case Success(_) => log.info(s"Inserted queue unack of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert queue unack of $id")
     }
   }
 

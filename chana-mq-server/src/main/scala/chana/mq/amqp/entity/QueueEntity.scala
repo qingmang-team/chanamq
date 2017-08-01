@@ -65,6 +65,7 @@ object QueueEntity {
   final case class Push(id: String, msgs: Vector[Msg], connectionId: Int) extends Command
   final case class Pull(id: String, consumerTag: Option[String], connectionId: Int, channelId: Int, prefetchCount: Int, prefetchSize: Long, autoAck: Boolean) extends Command
   final case class Acked(id: String, msgIds: collection.Set[Long]) extends Command
+  final case class Requeue(id: String, msgIds: collection.Set[Long]) extends Command
 
   final case class ConsumerStarted(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
   final case class ConsumerCancelled(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
@@ -89,10 +90,10 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
   private var connectionId = 0
   private var queueMsgTtl: Option[Long] = None
 
-  private var messageIds = Vector[Msg]()
+  private var messages = Vector[Msg]()
   private var lastConsumed = 0L
 
-  private var unacks = Set[Long]()
+  private var unacks = Map[Long, Msg]()
 
   // TODO for case of connection suddenly boken on server side, we should check last active time of consumers to remove it
   private var consumerToLastActive = Map[String, Long]()
@@ -113,8 +114,8 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         this.isDurable = isDurable
         this.lastConsumed = lastConsumed
         this.queueMsgTtl = queueMsgTtl
-        this.messageIds = msgs
-        this.unacks ++= unacks
+        this.messages = msgs
+        this.unacks ++= unacks.map(x => x.id -> x)
         val now = System.currentTimeMillis
         this.consumerToLastActive = consumers.map(_ -> now).toMap
 
@@ -140,7 +141,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
     case Loaded =>
       context.become(ready)
       unstashAll()
-      log.info(s"$id loaded: messageCount=${messageIds.length}, lastConsumed=$lastConsumed, consumers=${consumerToLastActive.size}, isDurable=$isDurable, unacked=$unacks")
+      log.info(s"$id loaded: messageCount=${messages.length}, lastConsumed=$lastConsumed, consumers=${consumerToLastActive.size}, isDurable=$isDurable, unacked=$unacks")
     case _ =>
       stash()
   }
@@ -199,9 +200,9 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         log.error(s"$m: access exclusive queue from another connection")
         commander ! (false, 0)
       } else {
-        val nPurged = messageIds.length
+        val nPurged = messages.length
         // removes all messages from a queue which are not awaiting ack -- we've kept in unacks
-        messageIds = Vector()
+        messages = Vector()
         val persist = if (isDurable) {
           storeService.deleteQueueMsgs(id)
         } else {
@@ -269,6 +270,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       }
 
     case m @ QueueEntity.Push(_, msgs, connectionId) =>
+      log.debug(s"Got $m")
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
@@ -279,7 +281,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       log.debug(s"$id msgs pushed in: $msgs")
 
       val now = System.currentTimeMillis
-      val newOffset = messageIds.lastOption match {
+      val newOffset = messages.lastOption match {
         case Some(last) => last.offset + 1
         case None       => lastConsumed + 1
       }
@@ -287,8 +289,8 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       val (_, offsetedMsgs) = msgs.foldLeft((newOffset, Vector[Msg]())) {
         case ((offset, offsetedMsgs), msg) =>
           queueMsgTtl match {
-            case Some(x) =>
-              val expireTime = msg.expireTime map (math.min(_, now + x)) orElse Some(now + x)
+            case Some(ttl) =>
+              val expireTime = msg.expireTime.map(math.min(_, now + ttl)) orElse Some(now + ttl)
               (offset + 1, offsetedMsgs :+ msg.copy(offset = offset, expireTime = expireTime))
             case None =>
               (offset + 1, offsetedMsgs :+ msg.copy(offset = offset))
@@ -297,7 +299,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
 
       log.debug(s"$id: offsetedMsgs = $offsetedMsgs")
 
-      messageIds ++= offsetedMsgs
+      messages ++= offsetedMsgs
 
       val persist = if (isDurable) {
         Future.sequence(offsetedMsgs map { msg =>
@@ -308,13 +310,14 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       }
 
       persist map { _ =>
-        commander ! consumerToLastActive.nonEmpty
+        commander ! consumerToLastActive.nonEmpty // consumer non empty -> will be consumed immediatelly
       } onComplete {
         case Success(_) =>
         case Failure(e) => log.error(e, e.getMessage)
       }
 
     case m @ QueueEntity.Pull(_, consumerTag, connectionId, channelId, prefetchCount, prefetchSize, autoAck) =>
+      log.debug(s"Got $m")
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
@@ -326,20 +329,23 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
           consumerToLastActive += (AMQConsumer.globalId(tag, connectionId, channelId) -> System.currentTimeMillis)
         }
 
-        if (messageIds.nonEmpty) {
-          val maxCount = math.min(messageIds.length, prefetchCount)
-          log.debug(s"$id msgs: $messageIds, max fetching count: $maxCount")
+        if (messages.nonEmpty) {
+          val maxCount = math.min(messages.length, prefetchCount)
+          log.debug(s"$id msgs: $messages, max fetching count: $maxCount")
 
           val now = System.currentTimeMillis
-          var msgIds = Vector[Long]()
+          // use LinkedHashMap to keep inserting order
+          val msgs = new mutable.LinkedHashMap[Long, Msg]()
           var count = 0
           var lastOffset = lastConsumed
           var msgsBodySize = 0
-          val msgsItr = messageIds.iterator
+          val msgsItr = messages.iterator
           while (msgsItr.hasNext && count < maxCount && msgsBodySize < prefetchSize) {
             val msg = msgsItr.next()
+            log.debug(s"now $now, msg expire time: ${msg.expireTime}")
             val expired = queueMsgTtl.isDefined && msg.expired(now)
 
+            // we do not need to concern about deleting expired msg from queue's persistence, which will expire by self
             if (expired) {
               count += 1
               lastOffset = msg.offset
@@ -349,34 +355,32 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
               if (msgsBodySize < prefetchSize) {
                 count += 1
                 lastOffset = msg.offset
-                msgIds :+= msg.id
+                msgs += (msg.id -> msg)
               }
             }
           }
-          (msgIds, count)
 
-          log.debug(s"$id msgIds: $count ${msgIds.mkString("(", ",", ")")}, lastConsumed: $lastConsumed, msgs left: ${messageIds.length}")
-
-          lastConsumed = lastOffset
-          messageIds = messageIds.drop(count)
-
-          if (msgIds.nonEmpty) {
+          if (msgs.nonEmpty) {
+            lastConsumed = lastOffset
+            messages = messages.drop(count)
             if (!autoAck) {
-              unacks ++= msgIds
+              unacks ++= msgs
             }
+
+            log.debug(s"$id msgs: $count $msgs, lastConsumed: $lastConsumed, msgs left: ${messages.length}")
 
             val persist = if (isDurable) {
               if (autoAck) {
                 storeService.consumedQueueMessages(id, lastConsumed, Vector())
               } else {
-                storeService.consumedQueueMessages(id, lastConsumed, msgIds)
+                storeService.consumedQueueMessages(id, lastConsumed, msgs.values)
               }
             } else {
               Future.successful(())
             }
 
             persist map { _ =>
-              commander ! msgIds
+              commander ! msgs.keys.toVector
             } onComplete {
               case Success(_) =>
               case Failure(e) => log.error(e, e.getMessage)
@@ -389,7 +393,8 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case QueueEntity.Acked(_, msgIds) =>
+    case m @ QueueEntity.Acked(_, msgIds) =>
+      log.debug(s"Got $m")
       val commander = sender()
 
       unacks --= msgIds
@@ -397,6 +402,39 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       Future.sequence(msgIds map { msgId =>
         if (isDurable) {
           storeService.deleteQueueUnack(id, msgId)
+        } else {
+          Future.successful(())
+        }
+      }) onComplete {
+        case Success(_) =>
+          commander ! true
+        case Failure(ex) =>
+          commander ! false
+          log.error(ex, ex.getMessage)
+      }
+
+    case m @ QueueEntity.Requeue(_, msgIds) =>
+      log.debug(s"Got $m")
+      val commander = sender()
+
+      val now = System.currentTimeMillis
+      val msgs = msgIds.flatMap(unacks.get).toVector.sortBy(_.offset)
+      messages = (msgs ++ messages).sortBy(_.offset)
+      messages.headOption foreach { x =>
+        lastConsumed = x.offset - 1
+      }
+
+      unacks --= msgIds
+
+      Future.sequence(msgIds map { msgId =>
+        if (isDurable) {
+          Future.sequence(msgs map { msg =>
+            storeService.insertQueueMsg(id, msg.offset, msg.id, msg.bodySize, msg.expireTime.map(_ - now))
+          }) flatMap { _ =>
+            storeService.insertLastConsumed(id, lastConsumed)
+          } flatMap { _ =>
+            storeService.deleteQueueUnack(id, msgId)
+          }
         } else {
           Future.successful(())
         }
@@ -425,7 +463,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
       Future.successful(())
     }
 
-    persist map { _ => QueueEntity.Statistics(existed, messageIds.length, consumerToLastActive.size) }
+    persist map { _ => QueueEntity.Statistics(existed, messages.length, consumerToLastActive.size) }
   }
 
   private def delete(connectionId: Int, isForce: Boolean): Future[(Boolean, Int)] = {
@@ -444,7 +482,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         Future.successful(())
       }
 
-      persist map { _ => (true, messageIds.length) }
+      persist map { _ => (true, messages.length) }
     }
 
   }

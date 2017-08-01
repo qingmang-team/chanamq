@@ -2,6 +2,7 @@ package chana.mq.amqp.server
 
 import chana.mq.amqp.Exchange
 import chana.mq.amqp.Message
+import chana.mq.amqp.Msg
 import chana.mq.amqp.Queue
 import chana.mq.amqp.model.BasicProperties
 import scala.concurrent.Future
@@ -19,12 +20,13 @@ package object store {
     def insertQueueMeta(id: String, lastConsumed: Long, consumers: Set[String], isDurable: Boolean, queueMsgTtl: Option[Long]): Future[Unit]
     def insertQueueMsg(id: String, startOffset: Long, msgId: Long, size: Int, ttl: Option[Long]): Future[Unit]
     def deleteQueueMsgs(id: String): Future[Unit]
-    def consumedQueueMessages(id: String, lastConsumed: Long, unacks: Vector[Long]): Future[Unit]
+    def insertLastConsumed(id: String, lastConsumed: Long): Future[Unit]
+    def consumedQueueMessages(id: String, lastConsumed: Long, unacks: Iterable[Msg]): Future[Unit]
     def selectQueue(id: String): Future[Option[Queue]]
     def forceDeleteQueue(id: String): Future[Unit]
     def pendingDeleteQueue(id: String): Future[Unit]
     def deleteQueueConsumedMsgs(id: String): Future[Unit]
-    def insertQueueUnacks(id: String, msgIds: List[Long]): Future[Unit]
+    def insertQueueUnack(id: String, offset: Long, msgId: Long, size: Int, ttl: Option[Long]): Future[Unit]
     def deleteQueueUnack(id: String, msgId: Long): Future[Unit]
 
     def insertExchange(id: String, tpe: String, isDurable: Boolean, isAutoDelete: Boolean, isInternal: Boolean, args: java.util.Map[String, Any]): Future[Unit]

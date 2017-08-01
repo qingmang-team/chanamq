@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS queue_metas (
 
 CREATE TABLE IF NOT EXISTS queue_unacks (
   id text, -- queue id/name
+  offset bigint,
   msgid bigint,
+  size int, -- body size
 
   PRIMARY KEY (id, msgid)
 );
@@ -63,7 +65,9 @@ CREATE TABLE IF NOT EXISTS queue_metas_deleted (
 
 CREATE TABLE IF NOT EXISTS queue_unacks_deleted (
   id text, -- queue id/name
+  offset bigint,
   msgid bigint,
+  size int, -- body size
 
   PRIMARY KEY (id, msgid)
 );

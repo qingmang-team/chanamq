@@ -638,6 +638,39 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         }
       }
 
+      private def receivedNack(channel: AMQChannel, deliveryTag: Long, multiple: Boolean, requeue: Boolean, isLastCommand: Boolean) {
+        val queueToUackMsgIds = mutable.Map[String, mutable.Set[Long]]()
+        if (multiple) {
+          val uackTags = channel.getMultipleTagsTill(deliveryTag)
+
+          channel.ackDeliveryTags(uackTags) foreach {
+            case (queue, msgId) => queueToUackMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
+          }
+        } else {
+          channel.ackDeliveryTag(deliveryTag) foreach {
+            case (queue, msgId) => queueToUackMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
+          }
+        }
+
+        if (requeue) {
+          queueToUackMsgIds map {
+            case (queue, msgIds) =>
+              queueSharding ! QueueEntity.Requeue(queue, msgIds)
+          }
+        } else {
+          queueToUackMsgIds map {
+            case (queue, msgIds) =>
+              msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
+              queueSharding ! QueueEntity.Acked(queue, msgIds)
+          }
+        }
+
+        if (isLastCommand) {
+          pushHeatbeatOrPendingOrMessagesOrPull()
+        }
+
+      }
+
       private def receivedCommands(commands: Vector[AMQCommand[AMQMethod]], lastCommand: AMQCommand[AMQMethod]) {
         log.debug(s"recv commands $commands")
         commands foreach (command => receivedCommand(command, command eq lastCommand))
@@ -645,18 +678,19 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
       private def receivedCommand(command: AMQCommand[AMQMethod], isLastCommand: Boolean) {
         val method = command.method
+        val channel = command.channel
         log.info(s"$id ${method.className}.${method}")
         isClientExpectingResponse = method.expectResponse
 
         method.classId match {
-          case Basic.`id`      => receivedBasicMethod(command.channel, method, isLastCommand)
-          case Queue.`id`      => receivedQueueMethod(command.channel, method, isLastCommand)
-          case Channel.`id`    => receivedChannelMethod(command.channel, method, isLastCommand)
-          case Exchange.`id`   => receivedExchangeMethod(command.channel, method, isLastCommand)
-          case Connection.`id` => receivedConnectionMethod(command.channel, method, isLastCommand)
-          case Access.`id`     => receivedAccessMethod(command.channel, method, isLastCommand)
-          case Tx.`id`         => receivedTxMethod(command.channel, method, isLastCommand)
-          case Confirm.`id`    => receivedConfirmMethod(command.channel, method, isLastCommand)
+          case Basic.`id`      => receivedBasicMethod(channel, method, isLastCommand)
+          case Queue.`id`      => receivedQueueMethod(channel, method, isLastCommand)
+          case Channel.`id`    => receivedChannelMethod(channel, method, isLastCommand)
+          case Exchange.`id`   => receivedExchangeMethod(channel, method, isLastCommand)
+          case Connection.`id` => receivedConnectionMethod(channel, method, isLastCommand)
+          case Access.`id`     => receivedAccessMethod(channel, method, isLastCommand)
+          case Tx.`id`         => receivedTxMethod(channel, method, isLastCommand)
+          case Confirm.`id`    => receivedConfirmMethod(channel, method, isLastCommand)
         }
 
         // reset for next command
@@ -1080,10 +1114,10 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             push(out, command.render)
 
           case Basic.Reject(deliveryTag, requeue) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            receivedNack(channel, deliveryTag, false, requeue, isLastCommand)
 
           case Basic.Nack(deliveryTag, multiple, requeue) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            receivedNack(channel, deliveryTag, multiple, requeue, isLastCommand)
 
           case Basic.RecoverAsync(requeue) =>
             log.info(s"TODO Method not be processed: ${method.getClass.getName}")
