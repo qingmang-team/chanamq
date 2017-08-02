@@ -335,7 +335,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
 
           val now = System.currentTimeMillis
           // use LinkedHashMap to keep inserting order
-          val msgs = new mutable.LinkedHashMap[Long, Msg]()
+          val msgIdToMsg = new mutable.LinkedHashMap[Long, Msg]()
           var count = 0
           var lastOffset = lastConsumed
           var msgsBodySize = 0
@@ -355,32 +355,32 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
               if (msgsBodySize < prefetchSize) {
                 count += 1
                 lastOffset = msg.offset
-                msgs += (msg.id -> msg)
+                msgIdToMsg += (msg.id -> msg)
               }
             }
           }
 
-          if (msgs.nonEmpty) {
+          if (msgIdToMsg.nonEmpty) {
             lastConsumed = lastOffset
             messages = messages.drop(count)
             if (!autoAck) {
-              unacks ++= msgs
+              unacks ++= msgIdToMsg
             }
 
-            log.debug(s"$id msgs: $count $msgs, lastConsumed: $lastConsumed, msgs left: ${messages.length}")
+            log.debug(s"$id msgs: $count $msgIdToMsg, lastConsumed: $lastConsumed, msgs left: ${messages.length}")
 
             val persist = if (isDurable) {
               if (autoAck) {
                 storeService.consumedQueueMessages(id, lastConsumed, Vector())
               } else {
-                storeService.consumedQueueMessages(id, lastConsumed, msgs.values)
+                storeService.consumedQueueMessages(id, lastConsumed, msgIdToMsg.values)
               }
             } else {
               Future.successful(())
             }
 
             persist map { _ =>
-              commander ! msgs.keys.toVector
+              commander ! msgIdToMsg.keys.toVector
             } onComplete {
               case Success(_) =>
               case Failure(e) => log.error(e, e.getMessage)

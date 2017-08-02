@@ -11,8 +11,7 @@
    * Connection.SecureOk / Connection.Blocked / Connection.Unblocked
    * Channel.Flow
    * Exchange.Bind / Exchange.Unbind
-   * ~~Basic.Reject~~ / ~~Basic.Nack~~ / Basic.RecoverAsync / Basic.Recover
-   * Access.Request
+   * ~~Basic.Reject~~ / ~~Basic.Nack~~ / ~~Basic.Recover~~ / Basic.RecoverAsync(use Basic.Recover)
    * Tx.Select / Tx.Commit / Tx.Rollback
    * ~~Confirm.Select~~ / ~~Confirm.SelectOk~~
 

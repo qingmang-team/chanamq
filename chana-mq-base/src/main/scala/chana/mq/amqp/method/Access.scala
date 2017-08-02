@@ -4,6 +4,12 @@ import chana.mq.amqp.model.ValueReader
 import java.io.DataInputStream
 import java.io.IOException
 
+/**
+ * AMQP 0-8 to 0-9-1:
+ * Access tickets have been removed. This involves the removal of the Access.Request
+ * method, and the deprecation of each and every ticket field in methods that used
+ * to require a ticket.
+ */
 object Access extends AMQClass {
   val id = 30
   val name = "access"

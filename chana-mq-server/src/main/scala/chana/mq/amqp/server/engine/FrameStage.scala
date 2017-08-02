@@ -259,7 +259,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       val frameParser = new FrameParser()
       var commandAssembler = new CommandAssembler(connection)
 
-      var payloadPendingToPush = ByteString.newBuilder
+      var pendingPayload = ByteString.newBuilder
 
       override def onUpstreamFinish() {
         log.info("upstream finished, going to close all channels")
@@ -368,10 +368,10 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           log.info(s"$id pushed heartbeat")
           isHeartbeatTime = false
 
-        } else if (payloadPendingToPush.nonEmpty) {
+        } else if (pendingPayload.nonEmpty) {
 
-          val payload = payloadPendingToPush.result
-          payloadPendingToPush.clear
+          val payload = pendingPayload.result
+          pendingPayload.clear
           push(out, payload)
 
         } else if (channelsContainConsumer.nonEmpty) {
@@ -413,16 +413,16 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                 val nMsgs = msgIds.size
                 if (nMsgs > 0) log.info(s"$id delivered msgs: $nMsgs")
 
-                val deliveryTags = channel.goingToDeliveryMsgs(msgIds, consumer, autoAck)
+                val deliveryMsgs = channel.goingToDeliveryMsgs(msgIds, consumer, autoAck)
 
                 if (autoAck) {
                   // Unrefer should happen after message got. Unrefer could be async
                   msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
                 }
 
-                (deliveryTags zip msgs).foldLeft(acc) {
-                  case (acc, (deliveryTag, Some(Message(msgId, header, body, exchange, routingKey, ttl)))) =>
-                    val method = Basic.Deliver(consumerTag, deliveryTag, redelivered = false, exchange, routingKey)
+                (deliveryMsgs zip msgs).foldLeft(acc) {
+                  case (acc, (deliveryMsg, Some(Message(msgId, header, body, exchange, routingKey, ttl)))) =>
+                    val method = Basic.Deliver(consumerTag, deliveryMsg.deliveryTag, redelivered = deliveryMsg.nDelivery > 1, exchange, routingKey)
                     val command = AMQCommand(channel, method, header, body)
 
                     acc ++= command.render
@@ -555,13 +555,13 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               }
           }
 
-          payloadPendingToPush = mandatoryReturns.foldLeft(ByteString.newBuilder) {
+          pendingPayload = mandatoryReturns.foldLeft(ByteString.newBuilder) {
             case (acc, pubCommand @ AMQCommand(channel, Basic.Publish(_, exchange, routingKey, _, _), header, body)) =>
               val command = AMQCommand(channel, Basic.Return(ErrorCodes.NO_ROUTE, ErrorCodes.noRoute, exchange, routingKey), header, body)
               acc ++= command.render
           }
 
-          payloadPendingToPush = immediateReturns.foldLeft(payloadPendingToPush) {
+          pendingPayload = immediateReturns.foldLeft(pendingPayload) {
             case (acc, AMQCommand(channel, Basic.Publish(_, exchange, routingKey, _, _), header, body)) =>
               val command = AMQCommand(channel, Basic.Return(ErrorCodes.NO_CONSUMERS, ErrorCodes.noConsumers, exchange, routingKey), header, body)
               acc ++= command.render
@@ -587,7 +587,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                 n = nx
               }
 
-              payloadPendingToPush = confirmed.foldLeft(payloadPendingToPush) {
+              pendingPayload = confirmed.foldLeft(pendingPayload) {
                 case (acc, (n, multiple)) =>
                   val command = AMQCommand(channel, Basic.Ack(n, multiple))
                   acc ++= command.render
@@ -638,27 +638,51 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         }
       }
 
+      /**
+       * Reject one or more incoming messages.
+       *
+       * This method allows a client to reject one or more incoming messages. It
+       * can be used to interrupt and cancel large incoming messages, or return
+       * untreatable messages to their original queue. This method is also used
+       * by the server to inform publishers on channels in confirm mode of unhandled
+       * messages. If a publisher receives this method, it probably needs to
+       * republish the offending messages.
+       *
+       * The server SHOULD be capable of accepting and processing the Nack method
+       * while sending message content with a Deliver or Get-Ok method. I.e. the
+       * server should read and process incoming methods while sending output frames.
+       * To cancel a partially-send content, the server sends a content body frame
+       * of size 1 (i.e. with no data except the frame-end octet).
+       *
+       * The server SHOULD interpret this method as meaning that the client is
+       * unable to process the message at this time.
+       *
+       * The client MUST NOT use this method as a means of selecting messages to process.
+       *
+       * A client publishing messages to a channel in confirm mode SHOULD be capable
+       * of accepting and somehow handling the Nack method.
+       */
       private def receivedNack(channel: AMQChannel, deliveryTag: Long, multiple: Boolean, requeue: Boolean, isLastCommand: Boolean) {
-        val queueToUackMsgIds = mutable.Map[String, mutable.Set[Long]]()
+        val queueToUnackMsgIds = mutable.Map[String, mutable.Set[Long]]()
         if (multiple) {
           val uackTags = channel.getMultipleTagsTill(deliveryTag)
 
           channel.ackDeliveryTags(uackTags) foreach {
-            case (queue, msgId) => queueToUackMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
+            case (queue, msgId) => queueToUnackMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
           }
         } else {
           channel.ackDeliveryTag(deliveryTag) foreach {
-            case (queue, msgId) => queueToUackMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
+            case (queue, msgId) => queueToUnackMsgIds.getOrElseUpdate(queue, new mutable.HashSet[Long]()) += msgId
           }
         }
 
         if (requeue) {
-          queueToUackMsgIds map {
+          queueToUnackMsgIds map {
             case (queue, msgIds) =>
               queueSharding ! QueueEntity.Requeue(queue, msgIds)
           }
         } else {
-          queueToUackMsgIds map {
+          queueToUnackMsgIds map {
             case (queue, msgIds) =>
               msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
               queueSharding ! QueueEntity.Acked(queue, msgIds)
@@ -668,7 +692,86 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         if (isLastCommand) {
           pushHeatbeatOrPendingOrMessagesOrPull()
         }
+      }
 
+      /**
+       * Redeliver unacknowledged messages.
+       * This method asks the server to redeliver all unacknowledged messages on
+       * a specified channel. Zero or more messages may be redelivered. This method
+       * replaces the asynchronous Recover.
+       *
+       * The server MUST set the redelivered flag on all messages that are resent.
+       *
+       * @params requeue If this field is zero, the message will be redelivered
+       *         to the original recipient. If this bit is 1, the server will
+       *         attempt to requeue the message, potentially then delivering it
+       *         to an alternative subscriber.
+       */
+      private def receivedRecover(channel: AMQChannel, requeue: Boolean, isLastCommand: Boolean) {
+        val consumerToUnackMsgIds = channel.unackedDeliveryTagToMsg.foldLeft(mutable.Map[AMQConsumer, mutable.Set[Long]]()) {
+          case (acc, (deliveryTag, msg)) =>
+            acc.getOrElseUpdate(msg.consumer, new mutable.HashSet[Long]()) += msg.msgId
+            acc
+        }
+
+        if (requeue) {
+          consumerToUnackMsgIds map {
+            case (consumer, msgIds) => queueSharding ! QueueEntity.Requeue(consumer.queue, msgIds)
+          }
+
+          channel.unackedDeliveryTagToMsg.clear
+          channel.unackedMsgIdToDeliveryMsg.clear
+
+          if (isLastCommand) {
+            pushHeatbeatOrPendingOrMessagesOrPull()
+          }
+
+        } else {
+
+          val future = Future.sequence(consumerToUnackMsgIds map {
+            case (consumer, msgIds) =>
+              log.debug(s"$id pulled: $msgIds")
+              val sortedMsgIds = msgIds.toVector.sorted
+              Future.sequence(sortedMsgIds map { msgId =>
+                (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
+              }) map { msgs => (consumer, sortedMsgIds, msgs) }
+          }) andThen {
+            case Success(_) =>
+            case Failure(e) => log.error(e, e.getMessage)
+          }
+
+          val callback = getAsyncCallback[mutable.Iterable[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { consumerAndMsgs =>
+            // Clear all unacked delivery tag. We'll deal with unackedMsgToDeliveryMsg later via removeUnReferredMsgId()
+            channel.unackedDeliveryTagToMsg.clear
+
+            pendingPayload = consumerAndMsgs.foldLeft(pendingPayload) {
+              case (acc, (consumer @ AMQConsumer(channel, consumerTag, queue, autoAck), msgIds, msgs)) =>
+                val nMsgs = msgIds.size
+                if (nMsgs > 0) log.info(s"$id delivered msgs: $nMsgs")
+
+                val deliveryMsgs = channel.goingToDeliveryMsgs(msgIds, consumer, autoAck)
+                channel.removeUnReferredMsgId()
+
+                (deliveryMsgs zip msgs).foldLeft(acc) {
+                  case (acc, (deliveryMsg, Some(Message(msgId, header, body, exchange, routingKey, ttl)))) =>
+                    val method = Basic.Deliver(consumerTag, deliveryMsg.deliveryTag, redelivered = true, exchange, routingKey)
+                    val command = AMQCommand(channel, method, header, body)
+
+                    acc ++= command.render
+                  case (acc, (_, None)) =>
+                    acc
+                }
+
+                acc
+            }
+
+            if (isLastCommand) {
+              pushHeatbeatOrPendingOrMessagesOrPull()
+            }
+          }
+
+          future.foreach(callback.invoke)
+        }
       }
 
       private def receivedCommands(commands: Vector[AMQCommand[AMQMethod]], lastCommand: AMQCommand[AMQMethod]) {
@@ -1085,12 +1188,12 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
             val callback = getAsyncCallback[Vector[Option[Message]]] {
               case Vector(Some(Message(msgId, header, body, exchange, routingKey, ttl))) =>
-                val deliveryTag = channel.goingToDeliveryMsgs(Vector(msgId), channel.basicGetConsumer, autoAck).head
+                val deliveryMsg = channel.goingToDeliveryMsgs(Vector(msgId), channel.basicGetConsumer, autoAck).head
                 if (autoAck) {
                   messageSharding ! MessageEntity.Unrefer(msgId.toString)
                 }
 
-                val method = Basic.GetOk(deliveryTag, redelivered = false, exchange, routingKey, 1)
+                val method = Basic.GetOk(deliveryMsg.deliveryTag, redelivered = deliveryMsg.nDelivery > 1, exchange, routingKey, 1)
                 val command = AMQCommand(channel, method, header, body)
 
                 push(out, command.render)
@@ -1119,18 +1222,18 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           case Basic.Nack(deliveryTag, multiple, requeue) =>
             receivedNack(channel, deliveryTag, multiple, requeue, isLastCommand)
 
-          case Basic.RecoverAsync(requeue) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
-
           case Basic.Recover(requeue) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            receivedRecover(channel, requeue, isLastCommand)
+
+          case m @ Basic.RecoverAsync(requeue) =>
+            log.warning(s"Got $m. Redeliver unacknowledged messages. This method asks the server to redeliver all unacknowledged messages on a specified channel. Zero or more messages may be redelivered. This method is deprecated in favour of the synchronous Recover/Recover-Ok.")
         }
       }
 
       private def receivedAccessMethod(channel: AMQChannel, method: AMQMethod, isLastCommand: Boolean) {
         method match {
-          case Access.Request(realm, exclusive, passive, active, write, read) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+          case m @ Access.Request(realm, exclusive, passive, active, write, read) =>
+            log.warning(s"Got $m. From AMQP 0-8 to 0-91, access tickets have been removed. This involves the removal of the Access.Request method, and the deprecation of each and every ticket field in methods that used to require a ticket.  The restrictions on virtual-host names have been removed.")
         }
       }
 

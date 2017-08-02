@@ -1,21 +1,22 @@
 package chana.mq.amqp.model
 
-import akka.util.ByteString
 import chana.mq.amqp.method.AMQClass
-import java.io.DataOutputStream
-import java.io.IOException
 import scala.collection.mutable
 
 object AMQChannel {
+  private type AMQMethod = AMQClass#Method
+
   sealed trait Mode
   case object Normal extends Mode
   case object Transaction extends Mode
   case object Confirm extends Mode
+
+  final case class DeliveryMsg(deliveryTag: Long, msgId: Long, consumer: AMQConsumer, nDelivery: Int)
 }
 class AMQChannel(val connection: AMQConnection, val id: Int) {
-  private type AMQMethod = AMQClass#Method
+  import AMQChannel._
 
-  var mode: AMQChannel.Mode = AMQChannel.Normal
+  var mode: Mode = Normal
 
   var isDoingPublishing = false
 
@@ -66,58 +67,83 @@ class AMQChannel(val connection: AMQConnection, val id: Int) {
   /**
    * Use LinkedHashMap to keep the original inserting order
    */
-  private val unackedDeliveryTagToMsgId = mutable.LinkedHashMap[Long, (Long, AMQConsumer)]()
+  val unackedDeliveryTagToMsg = new mutable.LinkedHashMap[Long, DeliveryMsg]()
+  /**
+   * TODO
+   * If nDelivery is more than for example 5 times, we should consider that this message
+   * will never to be delivered and drop it
+   */
+  val unackedMsgIdToDeliveryMsg = new mutable.HashMap[Long, DeliveryMsg]()
 
-  def nUnacks = unackedDeliveryTagToMsgId.size
+  def nUnacks = unackedDeliveryTagToMsg.size
+
+  def removeUnReferredMsgId() {
+    val msgIdsToRemove = unackedMsgIdToDeliveryMsg.collect {
+      case (msgId, msg) if !unackedDeliveryTagToMsg.contains(msg.deliveryTag) => msgId
+    }
+
+    unackedMsgIdToDeliveryMsg --= msgIdsToRemove
+  }
 
   /**
    * @return generated channel specific delivery tags
    */
-  def goingToDeliveryMsgs(msgIds: Vector[Long], consumer: AMQConsumer, autoAck: Boolean): Vector[Long] = {
+  def goingToDeliveryMsgs(msgIds: Vector[Long], consumer: AMQConsumer, autoAck: Boolean): Vector[DeliveryMsg] = {
     msgIds.map { msgId =>
       val tag = deliveryTag
+      deliveryTag += 1
+      val msg = unackedMsgIdToDeliveryMsg.get(msgId) match {
+        case Some(msg) => DeliveryMsg(tag, msgId, consumer, msg.nDelivery + 1)
+        case None      => DeliveryMsg(tag, msgId, consumer, 1)
+      }
+
       if (!autoAck) {
         consumer.nUnacks += 1
-        unackedDeliveryTagToMsgId += (tag -> (msgId, consumer))
+        unackedDeliveryTagToMsg += (tag -> msg)
+        unackedMsgIdToDeliveryMsg += (msgId -> msg)
       }
-      deliveryTag += 1
-      tag
+
+      msg
     }
   }
 
   def ackDeliveryTag(deliveryTag: Long): Option[(String, Long)] = {
-    val queueAndMsgId = msgIdOfDeliveryTag(deliveryTag) map {
-      case (msgId, consumer) =>
+    val queueAndMsgId = msgOfDeliveryTag(deliveryTag) map {
+      case DeliveryMsg(_, msgId, consumer, _) =>
         consumer.nUnacks -= 1
+        unackedMsgIdToDeliveryMsg -= msgId
+
         (consumer.queue, msgId)
     }
 
-    unackedDeliveryTagToMsgId -= deliveryTag
+    unackedDeliveryTagToMsg -= deliveryTag
 
     queueAndMsgId
   }
 
   def ackDeliveryTags(tags: collection.Set[Long]): collection.Set[(String, Long)] = {
     val queueAndMsgIds = tags map { tag =>
-      msgIdOfDeliveryTag(tag) map {
-        case (msgId, consumer) =>
+      msgOfDeliveryTag(tag) map {
+        case DeliveryMsg(_, msgId, consumer, _) =>
           consumer.nUnacks -= 1
+          unackedMsgIdToDeliveryMsg -= msgId
+
           (consumer.queue, msgId)
       }
     }
 
-    unackedDeliveryTagToMsgId --= tags
+    unackedDeliveryTagToMsg --= tags
 
     queueAndMsgIds.flatten
   }
 
-  def msgIdOfDeliveryTag(tag: Long): Option[(Long, AMQConsumer)] =
-    unackedDeliveryTagToMsgId.get(tag)
+  def msgOfDeliveryTag(tag: Long): Option[DeliveryMsg] =
+    unackedDeliveryTagToMsg.get(tag)
 
   def getMultipleTagsTill(diliveryTag: Long): collection.Set[Long] = {
     var tags = Set[Long]()
     var break = false
-    val unackedTags = unackedDeliveryTagToMsgId.keysIterator
+    val unackedTags = unackedDeliveryTagToMsg.keysIterator
     while (unackedTags.hasNext && !break) {
       val tag = unackedTags.next()
       if (tag <= diliveryTag) {
