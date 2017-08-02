@@ -81,25 +81,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
   private val id = System.identityHashCode(FrameStage.this)
 
-  private val channelsContainConsumer = mutable.Set[AMQChannel]()
-  private def addConsumer(channel: AMQChannel, consumer: AMQConsumer) {
-    if (channel.consumers.isEmpty) {
-      channelsContainConsumer += channel
-    }
-    channel.consumers enqueue consumer
-
-  }
-
-  private def removeConsumer(channel: AMQChannel, consumerTag: String) {
-    channel.consumers.dequeueFirst(_.tag == consumerTag)
-    if (channel.consumers.isEmpty) {
-      channelsContainConsumer -= channel
-    }
-  }
-
-  private def getConsumer(channel: AMQChannel, consumerTag: String): Option[AMQConsumer] = {
-    channel.consumers.find(_.tag == consumerTag)
-  }
+  private def outActiveChannels = connection.channels.values.filter(_.hasConsumers).filter(_.isOutFlowActive)
 
   private def exchangeSharding = ClusterSharding(system).shardRegion(ExchangeEntity.typeName)
   private def messageSharding = ClusterSharding(system).shardRegion(MessageEntity.typeName)
@@ -144,6 +126,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       future.foreach(callback.invoke)
     }
 
+    // TODO when to send Connection.Blocked and Channel.Flow
     private def pushConnectionBlocked(channel: AMQChannel, reason: String) {
       val command = AMQCommand(channel, Connection.Blocked(reason))
 
@@ -164,11 +147,10 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       }
     }
 
-    private def completeAndCloseChannel(channel: AMQChannel): Future[mutable.Queue[Boolean]] = {
-      Future.sequence(channel.consumers map { consumer => (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, consumer.channel.id)).mapTo[Boolean] }) map { done =>
-        channel.consumers.clear
+    private def completeAndCloseChannel(channel: AMQChannel): Future[Iterable[Boolean]] = {
+      Future.sequence(channel.allConsumers map { consumer => (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, consumer.channel.id)).mapTo[Boolean] }) map { done =>
+        channel.clearConsumers
         connection.channels -= channel.id
-        channelsContainConsumer -= channel
         done
       }
     }
@@ -349,7 +331,12 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
                   if (publishCommands.nonEmpty) {
                     log.debug(s"$id got publish commands: ${publishCommands.size}")
-                    receivedPublishes(publishCommands, isLastCommand = last.method.isInstanceOf[Basic.Publish])
+
+                    // we'll drop publishes of which channel is not in-flow active 
+                    val (actives, inactives) = publishCommands.partition(_.channel.isInFlowActive)
+                    receivedPublishes(actives, isLastCommand = last.method.isInstanceOf[Basic.Publish])
+
+                    log.warning(s"channels ${inactives.map(_.channel.id).toSet} should have been Channel.Flow(false), but are still sending content")
                   }
 
                   if (ackCommands.nonEmpty) {
@@ -374,80 +361,79 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           pendingPayload.clear
           push(out, payload)
 
-        } else if (channelsContainConsumer.nonEmpty) {
-
-          // fair play on consumers for each channel
-          val future = Future.sequence(channelsContainConsumer map { channel =>
-            log.debug(s"$id $channel has ${channel.consumers}")
-
-            val consumer = channel.consumers.dequeue
-            channel.consumers enqueue consumer
-
-            val prefetchCount = if (consumer.autoAck) {
-              channel.prefetchCount
-            } else {
-              val nUnacked = if (channel.prefetchGlobal) channel.nUnacks else consumer.nUnacks
-              channel.prefetchCount - nUnacked
-            }
-
-            log.debug(s"$id prefetchCount: $prefetchCount consumer unacks: ${consumer.nUnacks}")
-
-            if (prefetchCount > 0) {
-              (queueSharding ? QueueEntity.Pull(consumer.queue, Some(consumer.tag), connection.id, consumer.channel.id, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
-                log.debug(s"$id pulled: $msgIds")
-                Future.sequence(msgIds map { msgId =>
-                  (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
-                }) map { msgs => (consumer, msgIds, msgs) }
-              }
-            } else {
-              Future { (consumer, Vector.empty, Vector.empty) }
-            }
-          }) andThen {
-            case Success(_) =>
-            case Failure(e) => log.error(e, e.getMessage)
-          }
-
-          val callback = getAsyncCallback[mutable.Set[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { consumerAndMsgs =>
-            val body = consumerAndMsgs.foldLeft(ByteString.newBuilder) {
-              case (acc, (consumer @ AMQConsumer(channel, consumerTag, queue, autoAck), msgIds, msgs)) =>
-                val nMsgs = msgIds.size
-                if (nMsgs > 0) log.info(s"$id delivered msgs: $nMsgs")
-
-                val deliveryMsgs = channel.goingToDeliveryMsgs(msgIds, consumer, autoAck)
-
-                if (autoAck) {
-                  // Unrefer should happen after message got. Unrefer could be async
-                  msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
-                }
-
-                (deliveryMsgs zip msgs).foldLeft(acc) {
-                  case (acc, (deliveryMsg, Some(Message(msgId, header, body, exchange, routingKey, ttl)))) =>
-                    val method = Basic.Deliver(consumerTag, deliveryMsg.deliveryTag, redelivered = deliveryMsg.nDelivery > 1, exchange, routingKey)
-                    val command = AMQCommand(channel, method, header, body)
-
-                    acc ++= command.render
-                  case (acc, (_, None)) =>
-                    acc
-                }
-
-                acc
-            }
-
-            val payload = body.result
-            if (payload.nonEmpty) {
-              push(out, payload)
-            } else {
-              log.debug(s"$id delivered zero msgs")
-              pull(in)
-            }
-          }
-
-          future.foreach(callback.invoke)
-
         } else {
+          val activeChannels = outActiveChannels
+          if (activeChannels.nonEmpty) {
 
-          pull(in)
+            // fair play on consumers for each channel
+            val future = Future.sequence(activeChannels map { channel =>
+              val consumer = channel.nextRoundConsumer()
 
+              val prefetchCount = if (consumer.autoAck) {
+                channel.prefetchCount
+              } else {
+                val nUnacked = if (channel.prefetchGlobal) channel.nUnacks else consumer.nUnacks
+                channel.prefetchCount - nUnacked
+              }
+
+              log.debug(s"$id prefetchCount: $prefetchCount consumer unacks: ${consumer.nUnacks}")
+
+              if (prefetchCount > 0) {
+                (queueSharding ? QueueEntity.Pull(consumer.queue, Some(consumer.tag), connection.id, consumer.channel.id, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
+                  log.debug(s"$id pulled: $msgIds")
+                  Future.sequence(msgIds map { msgId =>
+                    (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
+                  }) map { msgs => (consumer, msgIds, msgs) }
+                }
+              } else {
+                Future { (consumer, Vector.empty, Vector.empty) }
+              }
+            }) andThen {
+              case Success(_) =>
+              case Failure(e) => log.error(e, e.getMessage)
+            }
+
+            val callback = getAsyncCallback[Iterable[(AMQConsumer, Vector[Long], Vector[Option[Message]])]] { consumerAndMsgs =>
+              val body = consumerAndMsgs.foldLeft(ByteString.newBuilder) {
+                case (acc, (consumer @ AMQConsumer(channel, consumerTag, queue, autoAck), msgIds, msgs)) =>
+                  val nMsgs = msgIds.size
+                  if (nMsgs > 0) log.info(s"$id delivered msgs: $nMsgs")
+
+                  val deliveryMsgs = channel.goingToDeliveryMsgs(msgIds, consumer, autoAck)
+
+                  if (autoAck) {
+                    // Unrefer should happen after message got. Unrefer could be async
+                    msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
+                  }
+
+                  (deliveryMsgs zip msgs).foldLeft(acc) {
+                    case (acc, (deliveryMsg, Some(Message(msgId, header, body, exchange, routingKey, ttl)))) =>
+                      val method = Basic.Deliver(consumerTag, deliveryMsg.deliveryTag, redelivered = deliveryMsg.nDelivery > 1, exchange, routingKey)
+                      val command = AMQCommand(channel, method, header, body)
+
+                      acc ++= command.render
+                    case (acc, (_, None)) =>
+                      acc
+                  }
+
+                  acc
+              }
+
+              val payload = body.result
+              if (payload.nonEmpty) {
+                push(out, payload)
+              } else {
+                log.debug(s"$id delivered zero msgs")
+                pull(in)
+              }
+            }
+
+            future.foreach(callback.invoke)
+          } else {
+
+            pull(in)
+
+          }
         }
       }
 
@@ -939,7 +925,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               case Failure(e) => log.error(e, e.getMessage)
             }
 
-            val callback = getAsyncCallback[mutable.Queue[Boolean]] { _ =>
+            val callback = getAsyncCallback[Iterable[Boolean]] { _ =>
               val command = AMQCommand(channel, Channel.CloseOk)
 
               push(out, command.render)
@@ -951,10 +937,14 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             log.info(s"TODO Method not be processed: ${method.getClass.getName}")
 
           case Channel.Flow(active) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            channel.isOutFlowActive = active
+            val command = AMQCommand(channel, Channel.FlowOk(active))
+
+            push(out, command.render)
 
           case Channel.FlowOk(active) =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            // TODO when to inactive channel's in-flow by sending Channel.Flow(active) to a specific channel
+            channel.isInFlowActive = active
         }
       }
 
@@ -1137,7 +1127,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
             val callback = getAsyncCallback[Boolean] { allowed =>
               if (allowed) {
-                addConsumer(channel, AMQConsumer(channel, consumerTag, queue, noAck))
+                channel.addConsumer(AMQConsumer(channel, consumerTag, queue, noAck))
                 log.info(s"$id added consumer: $consumerTag")
 
                 val command = AMQCommand(channel, Basic.ConsumeOk(consumerTag))
@@ -1151,7 +1141,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             future.foreach(callback.invoke)
 
           case Basic.Cancel(consumerTag, nowait) =>
-            getConsumer(channel, consumerTag) match {
+            channel.getConsumer(consumerTag) match {
               case Some(consumer) =>
                 val future = (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, channel.id)).mapTo[Boolean] andThen {
                   case Success(_) =>
@@ -1160,7 +1150,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
                 val callback = getAsyncCallback[Boolean] { allowed =>
                   if (allowed) {
-                    removeConsumer(channel, consumerTag)
+                    channel.removeConsumer(consumerTag)
                     log.info(s"$id removed consumer: $consumerTag")
 
                     val command = AMQCommand(channel, Basic.CancelOk(consumerTag))

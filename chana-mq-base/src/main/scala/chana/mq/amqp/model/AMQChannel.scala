@@ -20,6 +20,9 @@ class AMQChannel(val connection: AMQConnection, val id: Int) {
 
   var isDoingPublishing = false
 
+  var isOutFlowActive = true
+  var isInFlowActive = true
+
   private var confirmNumber = 1L
   def nextConfirmNumber() = {
     val n = confirmNumber
@@ -27,7 +30,22 @@ class AMQChannel(val connection: AMQConnection, val id: Int) {
     n
   }
 
-  val consumers = new mutable.Queue[AMQConsumer]()
+  // use LinkedHashMap as ordered Queue
+  private val consumers = new mutable.LinkedHashMap[String, AMQConsumer]()
+
+  def allConsumers = consumers.values
+  def clearConsumers = consumers.clear
+  def hasConsumers = consumers.nonEmpty
+  def addConsumer(consumer: AMQConsumer) { consumers += (consumer.tag -> consumer) }
+  def removeConsumer(consumerTag: String) { consumers -= consumerTag }
+  def getConsumer(consumerTag: String): Option[AMQConsumer] = consumers.get(consumerTag)
+
+  def nextRoundConsumer() = {
+    val (consumerTag, consumer) = consumers.head
+    consumers -= (consumerTag)
+    consumers += (consumerTag -> consumer)
+    consumer
+  }
 
   /**
    * The consumer which is used for Basic.Get method

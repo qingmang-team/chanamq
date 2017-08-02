@@ -9,7 +9,7 @@
  * ChanaMQ is still under the alpha phase.
  * Methods/Features are not supported yet:
    * Connection.SecureOk / Connection.Blocked / Connection.Unblocked
-   * Channel.Flow
+   * ~~Channel.Flow~~
    * Exchange.Bind / Exchange.Unbind
    * ~~Basic.Reject~~ / ~~Basic.Nack~~ / ~~Basic.Recover~~ / Basic.RecoverAsync(use Basic.Recover)
    * Tx.Select / Tx.Commit / Tx.Rollback
