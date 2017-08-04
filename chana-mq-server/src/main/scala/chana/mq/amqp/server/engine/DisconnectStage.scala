@@ -10,10 +10,10 @@ import akka.stream.stage.InHandler
 import akka.stream.stage.OutHandler
 import akka.util.ByteString
 
-final class TcpStage extends GraphStage[FlowShape[ByteString, Either[Control, ByteString]]] {
+final class DisconnectStage extends GraphStage[FlowShape[ByteString, Either[Control, ByteString]]] {
 
-  val in = Inlet[ByteString]("TcpStage.in")
-  val out = Outlet[Either[Control, ByteString]]("TcpStage.out")
+  val in = Inlet[ByteString]("DisconnectStage.in")
+  val out = Outlet[Either[Control, ByteString]]("DisconnectStage.out")
   override val shape = FlowShape.of(in, out)
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) {

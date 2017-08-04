@@ -6,7 +6,7 @@
 
 ## Status
 
- * ChanaMQ is still under the alpha phase.
+ * ChanaMQ is still in the alpha phase.
  * Methods/Features are not supported yet:
    * Connection.SecureOk / Connection.Blocked / Connection.Unblocked
    * ~~Channel.Flow~~

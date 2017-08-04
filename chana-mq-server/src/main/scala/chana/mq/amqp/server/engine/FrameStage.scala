@@ -265,7 +265,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
         grab(in) match {
           case Left(Disconnect) =>
-            log.info(s"$id Tcp upstream finished, going to close all channels")
+            log.info(s"$id Tcp upstream disconnected, going to close all channels")
             completeAndCloseAllChannels()
             completeStage()
 

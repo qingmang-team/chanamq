@@ -17,7 +17,9 @@ object SimplePublisher {
     //factory.setPassword(password)
     //factory.setVirtualHost(virtualHost)
     //factory.setHost(hostName)
-    //factory.setPort(5673)
+    factory.setPort(5671)
+    factory.useSslProtocol()
+
     val conn = factory.newConnection()
     val channel = conn.createChannel()
 

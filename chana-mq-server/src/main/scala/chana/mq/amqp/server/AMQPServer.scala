@@ -2,34 +2,35 @@ package chana.mq.amqp.server
 
 import akka.NotUsed
 import akka.actor.ActorSystem
-import akka.event.Logging
+import akka.event.LoggingAdapter
 import akka.stream.ActorMaterializer
-import akka.stream.FlowShape
-import akka.stream.OverflowStrategy
+import akka.stream.scaladsl.BidiFlow
 import akka.stream.scaladsl.Flow
-import akka.stream.scaladsl.GraphDSL
-import akka.stream.scaladsl.MergePreferred
-import akka.stream.scaladsl.Sink
-import akka.stream.scaladsl.Source
-import akka.stream.scaladsl.Tcp
 import akka.util.ByteString
+import chana.mq.amqp.Amqp
+import chana.mq.amqp.ConnectionContext
+import chana.mq.amqp.ServerSettings
 import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.entity.MessageEntity
 import chana.mq.amqp.entity.QueueEntity
-import chana.mq.amqp.server.engine.FrameStage
-import chana.mq.amqp.server.engine.TcpStage
+import chana.mq.amqp.server.engine.ServerBluePrint
 import chana.mq.amqp.server.service.GlobalNodeIdService
-import scala.concurrent.Future
-import scala.concurrent.duration._
-import scala.util.Failure
-import scala.util.Success
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.security.KeyStore
+import java.security.SecureRandom
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManagerFactory
 
+/**
+ * raw tcp stream:
+ * Flow[ByteString, ByteString, Future[OutgoingConnection]]
+ */
 object AMQPServer {
 
   implicit val system = ActorSystem("chanamq")
   implicit val materializer = ActorMaterializer()
-
-  val log = Logging(system, this.getClass)
 
   GlobalNodeIdService.start(system, Some("entity"))
   GlobalNodeIdService.startProxy(system, Some("entity"))
@@ -39,54 +40,51 @@ object AMQPServer {
   MessageEntity.startSharding(system)
 
   def main(args: Array[String]) {
-    // raw tcp stream
-    // Flow[ByteString, ByteString, Future[OutgoingConnection]]
 
-    val serverConfig = system.settings.config.getConfig("chana.mq.server")
+    val amqpServerConfig = system.settings.config.getConfig("chana.mq.amqp.server")
+    val amqpEnable = amqpServerConfig.getBoolean("enable")
+    val amqpHost = amqpServerConfig.getString("interface")
+    val amqpPort = amqpServerConfig.getInt("port")
 
-    val host = serverConfig.getString("interface")
-    val port = serverConfig.getInt("port")
+    val amqpsServerConfig = system.settings.config.getConfig("chana.mq.amqps.server")
+    val amqpsEnable = amqpsServerConfig.getBoolean("enable")
+    val amqpsHost = amqpsServerConfig.getString("interface")
+    val amqpsPort = amqpsServerConfig.getInt("port")
 
-    /**
-     *
-     *                      +------------+  +--------------+
-     * tcpIn  -> tcpStage  ->            |  |              -> tcpOut
-     *                      |  merge     -> | frameHandler |
-     *             control ->            |  |              |
-     *                      +------------|  +--------------+
-     *
-     */
-    def serverLogic()(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] =
-      Flow.fromGraph(GraphDSL.create() { implicit builder =>
-        import GraphDSL.Implicits._
+    val serverSetting = ServerSettings(system)
 
-        val control = builder.add(Source.tick(0.seconds, 1.micros, Left(engine.Tick)).buffer(1, OverflowStrategy.dropNew))
-        val tcpIncoming = builder.add(Flow[ByteString])
-        val tcpStage = builder.add(new TcpStage())
-        val frameStage = builder.add(new FrameStage())
-
-        val merge = builder.add(MergePreferred[Either[engine.Control, ByteString]](1))
-        tcpIncoming ~> tcpStage ~> merge.preferred
-        control ~> merge.in(0)
-        merge ~> frameStage.in
-
-        FlowShape(tcpIncoming.in, frameStage.out)
-      })
-
-    val connectionSink = Sink.foreach[Tcp.IncomingConnection] { conn =>
-      log.info(s"Incoming connection from: ${conn.remoteAddress}")
-      conn.handleWith(serverLogic())
+    if (amqpEnable) {
+      Amqp().startServer(amqpHost, amqpPort)(serverLogic)
     }
 
-    val binding: Future[Tcp.ServerBinding] = Tcp().bind(host, port).to(connectionSink).run()
+    if (amqpsEnable) {
+      val sslConfig = system.settings.config.getConfig("chana.mq.ssl")
 
-    import system.dispatcher
-    binding onComplete {
-      case Success(b) =>
-        log.info(s"Server started, listening on: ${b.localAddress}")
-      case Failure(e) =>
-        log.info(s"Server could not be bound to $host:$port: ${e.getMessage}")
+      val password = sslConfig.getString("password").toCharArray
+      val keystorePath = Paths.get(sslConfig.getString("keystore"))
+      val keystore = Files.newInputStream(keystorePath)
+
+      require(keystore != null, "Keystore required!")
+      val ks = KeyStore.getInstance("PKCS12")
+      ks.load(keystore, password)
+
+      val kmf = KeyManagerFactory.getInstance("SunX509")
+      kmf.init(ks, password)
+
+      val tmf = TrustManagerFactory.getInstance("SunX509")
+      tmf.init(ks)
+
+      val sslContext = SSLContext.getInstance("TLS")
+      sslContext.init(kmf.getKeyManagers, tmf.getTrustManagers, new SecureRandom())
+      val amqps = ConnectionContext.amqps(sslContext)
+
+      Amqp().setDefaultServerAmqpContext(amqps)
+      Amqp().startServer(amqpsHost, amqpsPort)(serverLogic)
     }
-
   }
+
+  def serverLogic(settings: ServerSettings, log: LoggingAdapter, sslTlsStage: BidiFlow[ByteString, ByteString, ByteString, ByteString, NotUsed])(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] = {
+    ServerBluePrint(settings, log, sslTlsStage)
+  }
+
 }
