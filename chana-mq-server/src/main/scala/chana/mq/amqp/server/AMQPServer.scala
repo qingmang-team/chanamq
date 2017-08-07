@@ -83,8 +83,8 @@ object AMQPServer {
     }
   }
 
-  def serverLogic(settings: ServerSettings, log: LoggingAdapter, sslTlsStage: BidiFlow[ByteString, ByteString, ByteString, ByteString, NotUsed])(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] = {
-    ServerBluePrint(settings, log, sslTlsStage)
+  def serverLogic(settings: ServerSettings, log: LoggingAdapter)(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] = {
+    ServerBluePrint(settings, log)
   }
 
 }

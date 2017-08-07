@@ -57,19 +57,34 @@ class AmqpExtention(private val config: Config)(implicit val system: ActorSystem
 
   private[this] final val DefaultPortForProtocol = -1 // any negative value
 
-  type ServerLogic = (ServerSettings, LoggingAdapter, BidiFlow[ByteString, ByteString, ByteString, ByteString, NotUsed]) => Flow[ByteString, ByteString, NotUsed]
+  type ServerLogic = (ServerSettings, LoggingAdapter) => Flow[ByteString, ByteString, NotUsed]
 
+  /**
+   * fullLayer:
+   *
+   * {{{
+   *                      +------------+             +-------------+
+   *  tcpIn   ->     in2 ->            -> out2  in  ->             |
+   *                      |  tlsStage  |             | serverStage |
+   *  tcpOut  <-    out1 <-            <- in1   out <-             |
+   *                      +------------+             +-------------+
+   * }}}
+   *
+   */
   def startServer(
     interface: String, port: Int,
     connectionContext: ConnectionContext = defaultServerAmqpContext,
     settings:          ServerSettings    = ServerSettings(system),
     log:               LoggingAdapter    = system.log
   )(serverLogic: ServerLogic)(implicit mat: Materializer) {
-    val sslTls = sslTlsStage(connectionContext, TLSRole.server)
+    val sslTlsLayer = sslTlsStage(connectionContext, TLSRole.server)
+    val serverLayer = serverLogic(settings, log)
+
+    val fullLayer = sslTlsLayer.reversed.join(serverLayer)
 
     val connectionSink = Sink.foreach[Tcp.IncomingConnection] { incomingConn =>
       system.log.info(s"Incoming connection from: ${incomingConn.remoteAddress}")
-      incomingConn.handleWith(serverLogic(settings, log, sslTls))
+      incomingConn.handleWith(fullLayer)
     }
 
     val binding: Future[Tcp.ServerBinding] = tcpBind(interface, choosePort(port, connectionContext), settings).to(connectionSink).run()

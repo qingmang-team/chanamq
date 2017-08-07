@@ -1,11 +1,9 @@
 package chana.mq.amqp.server.engine
 
-import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.event.LoggingAdapter
 import akka.stream.FlowShape
 import akka.stream.OverflowStrategy
-import akka.stream.scaladsl.BidiFlow
 import akka.stream.scaladsl.Flow
 import akka.stream.scaladsl.GraphDSL
 import akka.stream.scaladsl.MergePreferred
@@ -19,31 +17,6 @@ object ServerBluePrint {
 
   /**
    *
-   *                     +------------+             +-------------+
-   * tcpOut  <-    out1 <-            <- in1   out <-             |
-   *                     |  tlsStage  |             | serverStage |
-   * tcpIn   ->     in2 ->            -> out2  in  ->             |
-   *                     +------------+             +-------------+
-   *
-   */
-  def apply(settings: ServerSettings, log: LoggingAdapter, sslTlsStage: BidiFlow[ByteString, ByteString, ByteString, ByteString, NotUsed])(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] = {
-    Flow.fromGraph(GraphDSL.create() { implicit builder =>
-      import GraphDSL.Implicits._
-
-      val tcpIncoming = builder.add(Flow[ByteString])
-      val serverStage = builder.add(plain(settings, log))
-      val tlsStage = builder.add(sslTlsStage)
-
-      tcpIncoming ~> tlsStage.in2
-      tlsStage.out2 ~> serverStage.in
-      serverStage.out ~> tlsStage.in1
-
-      FlowShape(tcpIncoming.in, tlsStage.out1)
-    })
-  }
-
-  /**
-   *
    *                        +------------+  +------------+
    * incoming -> discStage ->            |  |            -> outgoing
    *                        |  merge     -> | frameStage |
@@ -51,7 +24,7 @@ object ServerBluePrint {
    *                        +------------+  +------------+
    *
    */
-  private def plain(settings: ServerSettings, log: LoggingAdapter)(implicit system: ActorSystem) = {
+  def apply(settings: ServerSettings, log: LoggingAdapter)(implicit system: ActorSystem) = {
     Flow.fromGraph(GraphDSL.create() { implicit builder =>
       import GraphDSL.Implicits._
 
