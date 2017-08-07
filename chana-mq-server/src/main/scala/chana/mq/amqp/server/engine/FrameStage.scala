@@ -57,9 +57,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
   private val log = Logging(system, this.getClass)
 
-  private val connection = {
+  private lazy val connection = {
     val conn = new AMQConnection()
-    val connConfig = system.settings.config.getConfig("chana.mq.connection")
+    val connConfig = system.settings.config.getConfig("chana.mq.amqp.connection")
 
     conn.channelMax = connConfig.getInt("channel-max")
     conn.frameMax = connConfig.getInt("frame-max")
@@ -72,7 +72,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
     conn
   }
 
-  private var virtualHost: VirtualHost = _
+  var vhost: String = _
 
   val in = Inlet[Either[Control, ByteString]]("tcp-in")
   val out = Outlet[ByteString]("tcp-out")
@@ -142,13 +142,13 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
     private def completeAndCloseAllChannels(): Future[Iterable[Boolean]] = {
       Future.sequence(connection.channels.values map completeAndCloseChannel) flatMap { _ =>
         Future.sequence(connection.exclusiveQueues map { queue =>
-          (queueSharding ? QueueEntity.ForceDelete(queue, connection.id)).mapTo[Boolean]
+          (queueSharding ? QueueEntity.ForceDelete(vhost, queue, connection.id)).mapTo[Boolean]
         })
       }
     }
 
     private def completeAndCloseChannel(channel: AMQChannel): Future[Iterable[Boolean]] = {
-      Future.sequence(channel.allConsumers map { consumer => (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, consumer.channel.id)).mapTo[Boolean] }) map { done =>
+      Future.sequence(channel.allConsumers map { consumer => (queueSharding ? QueueEntity.ConsumerCancelled(vhost, consumer.queue, consumer.tag, connection.id, consumer.channel.id)).mapTo[Boolean] }) map { done =>
         channel.clearConsumers
         connection.channels -= channel.id
         done
@@ -379,7 +379,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               log.debug(s"$id prefetchCount: $prefetchCount consumer unacks: ${consumer.nUnacks}")
 
               if (prefetchCount > 0) {
-                (queueSharding ? QueueEntity.Pull(consumer.queue, Some(consumer.tag), connection.id, consumer.channel.id, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
+                (queueSharding ? QueueEntity.Pull(vhost, consumer.queue, Some(consumer.tag), connection.id, consumer.channel.id, prefetchCount, channel.prefetchSize, consumer.autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
                   log.debug(s"$id pulled: $msgIds")
                   Future.sequence(msgIds map { msgId =>
                     (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
@@ -494,7 +494,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                 }
             }) flatMap {
               case pubs =>
-                (exchangeSharding ? ExchangeEntity.Publishs(exchange, pubs, connection.id)).mapTo[Vector[(Long, Boolean, Boolean)]]
+                (exchangeSharding ? ExchangeEntity.Publishs(vhost, exchange, pubs, connection.id)).mapTo[Vector[(Long, Boolean, Boolean)]]
             }
         }) andThen {
           case Success(_) => log.info(s"$id published msgs: ${publishes.size}")
@@ -614,7 +614,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         queueToAckMsgIds map {
           case (queue, msgIds) =>
             msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
-            queueSharding ! QueueEntity.Acked(queue, msgIds)
+            queueSharding ! QueueEntity.Acked(vhost, queue, msgIds)
         }
 
         log.info(s"$id acked in ${System.currentTimeMillis - start}ms")
@@ -665,13 +665,13 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         if (requeue) {
           queueToUnackMsgIds map {
             case (queue, msgIds) =>
-              queueSharding ! QueueEntity.Requeue(queue, msgIds)
+              queueSharding ! QueueEntity.Requeue(vhost, queue, msgIds)
           }
         } else {
           queueToUnackMsgIds map {
             case (queue, msgIds) =>
               msgIds foreach { msgId => messageSharding ! MessageEntity.Unrefer(msgId.toString) }
-              queueSharding ! QueueEntity.Acked(queue, msgIds)
+              queueSharding ! QueueEntity.Acked(vhost, queue, msgIds)
           }
         }
 
@@ -702,7 +702,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
         if (requeue) {
           consumerToUnackMsgIds map {
-            case (consumer, msgIds) => queueSharding ! QueueEntity.Requeue(consumer.queue, msgIds)
+            case (consumer, msgIds) => queueSharding ! QueueEntity.Requeue(vhost, consumer.queue, msgIds)
           }
 
           channel.unackedDeliveryTagToMsg.clear
@@ -768,7 +768,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       private def receivedCommand(command: AMQCommand[AMQMethod], isLastCommand: Boolean) {
         val method = command.method
         val channel = command.channel
-        log.info(s"$id ${method.className}.${method}")
+        log.info(s"$id channel:${command.channel.id} ${method.className}.${method}")
         isClientExpectingResponse = method.expectResponse
 
         method.classId match {
@@ -834,20 +834,25 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             }
             schedulePeriodically(None, connection.writerHeartbeat)
 
-          case Connection.Open(virtualHostName, capabilities, insist) =>
-            val virtualHostStr = if ((virtualHostName != null) && virtualHostName.charAt(0) == '/') {
-              virtualHostName.substring(1)
+          case Connection.Open(virtualHost, capabilities, insist) =>
+            val vhId = if (virtualHost != null && virtualHost.charAt(0) == '/') {
+              virtualHost.substring(1)
             } else {
-              virtualHostName
+              virtualHost
             }
 
-            val virtualHost = VirtualHost(UUID.randomUUID, true)
+            connection.virtualHost = VirtualHost.getVirtualHost(vhId) match {
+              case Some(x) => x
+              case None    => VirtualHost.createVirtualHost(vhId) // TODO
+            }
 
-            if (virtualHost == null) {
-              pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, "Unknown virtual host: '" + virtualHostName + "'", method.classId, method.id)
+            vhost = vhId
+
+            if (connection.virtualHost == null) {
+              pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, "Unknown virtual host: '" + virtualHost + "'", method.classId, method.id)
             } else {
               // Check virtualhost access
-              if (!virtualHost.isActive) {
+              if (!connection.virtualHost.isActive) {
                 //String redirectHost = addressSpace.getRedirectHost(getPort());
                 //if(redirectHost != null) {
                 // sendConnectionClose(0, new AMQFrame(0, new ConnectionRedirectBody(getProtocolVersion(), AMQShortString.valueOf(redirectHost), null)));
@@ -856,11 +861,8 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                 //}
               } else {
                 try {
-                  FrameStage.this.virtualHost = virtualHost
-                  //setAddressSpace(addressSpace)
-
-                  if (virtualHost.authoriseCreateConnection(connection)) {
-                    val command = AMQCommand(connection.channel0, Connection.OpenOk(virtualHostName))
+                  if (connection.virtualHost.authoriseCreateConnection(connection)) {
+                    val command = AMQCommand(connection.channel0, Connection.OpenOk(virtualHost))
 
                     push(out, command.render)
                     //_state = ConnectionState.OPEN
@@ -905,8 +907,8 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             //assertState(ConnectionState.OPEN)
 
             // Protect the broker against out of order frame request.
-            val response = if (virtualHost == null) {
-              pushConnectionClose(channel.id, ErrorCodes.COMMAND_INVALID, "Virtualhost has not yet been set. ConnectionOpen has not been called.", method.classId, method.id)
+            val response = if (connection.virtualHost == null) {
+              pushConnectionClose(channel.id, ErrorCodes.COMMAND_INVALID, "Virtualhost has not yet been set. Connection.Open has not been called.", method.classId, method.id)
             } else if (connection.channels.get(channel.id).isDefined /*|| channelAwaitingClosure(channelId)*/ ) {
               pushConnectionClose(channel.id, ErrorCodes.CHANNEL_ERROR, "Channel " + channel.id + " already exists", method.classId, method.id)
             } else if (channel.id > connection.channelMax) {
@@ -951,7 +953,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       private def receivedExchangeMethod(channel: AMQChannel, method: AMQMethod, isLastCommand: Boolean) {
         method match {
           case Exchange.Declare(reserved_1, exchange, tpe, passive, durable, autoDelete, internal, nowait, arguments) =>
-            val future = (exchangeSharding ? ExchangeEntity.Existed(exchange)).mapTo[Boolean] flatMap {
+            val future = (exchangeSharding ? ExchangeEntity.Existed(vhost, exchange)).mapTo[Boolean] flatMap {
               case true =>
                 log.debug(s"Exchange $exchange existed")
                 Future.successful((true, false))
@@ -961,7 +963,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                   Future.successful((false, false))
                 } else {
                   log.debug(s"Exchange $exchange does not exist, will create it")
-                  (exchangeSharding ? ExchangeEntity.Declare(exchange, tpe, durable, autoDelete, internal, arguments)).mapTo[Boolean] map (created => (false, created))
+                  (exchangeSharding ? ExchangeEntity.Declare(vhost, exchange, tpe, durable, autoDelete, internal, arguments)).mapTo[Boolean] map (created => (false, created))
                 }
             } andThen {
               case Success(_) =>
@@ -982,9 +984,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             future.foreach(callback.invoke)
 
           case Exchange.Delete(reserved_1, exchange, ifUnused, nowait) =>
-            val future = (exchangeSharding ? ExchangeEntity.Existed(exchange)).mapTo[Boolean] flatMap {
+            val future = (exchangeSharding ? ExchangeEntity.Existed(vhost, exchange)).mapTo[Boolean] flatMap {
               case true =>
-                (exchangeSharding ? ExchangeEntity.Delete(exchange, ifUnused, connection.id)).mapTo[Boolean] map (deleted => (true, deleted))
+                (exchangeSharding ? ExchangeEntity.Delete(vhost, exchange, ifUnused, connection.id)).mapTo[Boolean] map (deleted => (true, deleted))
               case false =>
                 Future.successful((false, false))
             } andThen {
@@ -1015,112 +1017,132 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
       private def receivedQueueMethod(channel: AMQChannel, method: AMQMethod, isLastCommand: Boolean) {
         method match {
           case Queue.Declare(reserved_1, queue, passive, durable, exclusive, autoDelete, nowait, arguments) =>
-            val queueName = if (queue == null || queue == "") {
-              "tmp." + UUID.randomUUID
+            if (queue != null && queue.startsWith("amp.")) {
+              pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, s"Queue $queue starting with 'amq.' are reserved for internal use by the broker", method.classId, method.id)
             } else {
-              queue
-            }
-
-            if (exclusive) {
-              connection.exclusiveQueues += queue
-            }
-
-            val ttl = arguments.get("x-message-ttl") match {
-              case Some(x: Int)  => Some(x.longValue)
-              case Some(x: Long) => Some(x)
-              case _             => None
-            }
-
-            val future = (queueSharding ? QueueEntity.Declare(queueName, durable, exclusive, autoDelete, connection.id, ttl)).mapTo[QueueEntity.Statistics] andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
-            }
-
-            val callback = getAsyncCallback[QueueEntity.Statistics] { statis =>
-              if (passive && !statis.existed) {
-                pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, s"Queue $queueName does not exists when passive declared", method.classId, method.id)
+              val queueName = if (queue == null || queue == "") {
+                "tmp." + UUID.randomUUID
               } else {
-                val method = Queue.DeclareOk(queueName, statis.queueSize, statis.consumerCount)
+                queue
+              }
+
+              if (exclusive) {
+                connection.exclusiveQueues += queue
+              }
+
+              val ttl = arguments.get("x-message-ttl") match {
+                case Some(x: Int)  => Some(x.longValue)
+                case Some(x: Long) => Some(x)
+                case _             => None
+              }
+
+              val future = (queueSharding ? QueueEntity.Declare(vhost, queueName, durable, exclusive, autoDelete, connection.id, ttl)).mapTo[QueueEntity.Statistics] andThen {
+                case Success(_) =>
+                case Failure(e) => log.error(e, e.getMessage)
+              }
+
+              val callback = getAsyncCallback[QueueEntity.Statistics] { statis =>
+                if (passive && !statis.existed) {
+                  pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, s"Queue $queueName does not exists when passive declared", method.classId, method.id)
+                } else {
+                  val method = Queue.DeclareOk(queueName, statis.queueSize, statis.consumerCount)
+                  val command = AMQCommand(channel, method)
+
+                  push(out, command.render)
+                }
+              }
+
+              future.foreach(callback.invoke)
+            }
+
+          case Queue.Bind(reserved_1, queue, exchange, routingKey, nowait, arguments) =>
+            if (queue != null && queue.startsWith("amp.")) {
+              pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, s"Queue $queue starting with 'amq.' are reserved for internal use by the broker", method.classId, method.id)
+            } else {
+              val future = (exchangeSharding ? ExchangeEntity.QueueBind(vhost, exchange, queue, routingKey, arguments)).mapTo[Boolean] andThen {
+                case Success(_) =>
+                case Failure(e) => log.error(e, e.getMessage)
+              }
+
+              val callback = getAsyncCallback[Boolean] { _ =>
+                val method = Queue.BindOk
                 val command = AMQCommand(channel, method)
 
                 push(out, command.render)
               }
+
+              future.foreach(callback.invoke)
             }
-
-            future.foreach(callback.invoke)
-
-          case Queue.Bind(reserved_1, queue, exchange, routingKey, nowait, arguments) =>
-            val future = (exchangeSharding ? ExchangeEntity.QueueBind(exchange, queue, routingKey, arguments)).mapTo[Boolean] andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
-            }
-
-            val callback = getAsyncCallback[Boolean] { _ =>
-              val method = Queue.BindOk
-              val command = AMQCommand(channel, method)
-
-              push(out, command.render)
-            }
-
-            future.foreach(callback.invoke)
 
           case Queue.Unbind(reserved_1, queue, exchange, routingKey, arguments) =>
-            val future = (exchangeSharding ? ExchangeEntity.QueueUnbind(exchange, queue, routingKey, arguments)).mapTo[Boolean] andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
+            if (queue != null && queue.startsWith("amp.")) {
+              pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, s"Queue $queue starting with 'amq.' are reserved for internal use by the broker", method.classId, method.id)
+            } else {
+              val future = (exchangeSharding ? ExchangeEntity.QueueUnbind(vhost, exchange, queue, routingKey, arguments)).mapTo[Boolean] andThen {
+                case Success(_) =>
+                case Failure(e) => log.error(e, e.getMessage)
+              }
+
+              val callback = getAsyncCallback[Boolean] { _ =>
+                val method = Queue.UnbindOk
+                val command = AMQCommand(channel, method)
+
+                push(out, command.render)
+              }
+
+              future.foreach(callback.invoke)
             }
-
-            val callback = getAsyncCallback[Boolean] { _ =>
-              val method = Queue.UnbindOk
-              val command = AMQCommand(channel, method)
-
-              push(out, command.render)
-            }
-
-            future.foreach(callback.invoke)
 
           case Queue.Purge(reserved_1, queue, nowait) =>
-            val future = (queueSharding ? QueueEntity.Purge(queue, connection.id)).mapTo[(Boolean, Int)] andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
+            if (queue != null && queue.startsWith("amp.")) {
+              pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, s"Queue $queue starting with 'amq.' are reserved for internal use by the broker", method.classId, method.id)
+            } else {
+              val future = (queueSharding ? QueueEntity.Purge(vhost, queue, connection.id)).mapTo[(Boolean, Int)] andThen {
+                case Success(_) =>
+                case Failure(e) => log.error(e, e.getMessage)
+              }
+
+              val callback = getAsyncCallback[(Boolean, Int)] {
+                case (true, nMsgsPurged) =>
+                  val method = Queue.PurgeOk(nMsgsPurged)
+                  val command = AMQCommand(channel, method)
+
+                  push(out, command.render)
+                case (false, _) =>
+                  pushConnectionClose(0, ErrorCodes.NOT_ALLOWED, s"Queue $queue is exclusive and is not allowed to access from another connetion", method.classId, method.id)
+              }
+
+              future.foreach(callback.invoke)
             }
-
-            val callback = getAsyncCallback[(Boolean, Int)] {
-              case (true, nMsgsPurged) =>
-                val method = Queue.PurgeOk(nMsgsPurged)
-                val command = AMQCommand(channel, method)
-
-                push(out, command.render)
-              case (false, _) =>
-                pushConnectionClose(0, ErrorCodes.NOT_ALLOWED, s"Queue $queue is exclusive and is not allowed to access from another connetion", method.classId, method.id)
-            }
-
-            future.foreach(callback.invoke)
 
           case Queue.Delete(reserved_1, queue, ifUnused, ifEmpty, nowait) =>
-            val future = (queueSharding ? QueueEntity.PendingDelete(queue, connection.id)).mapTo[(Boolean, Int)] andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
+            if (queue != null && queue.startsWith("amp.")) {
+              pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, s"Queue $queue starting with 'amq.' are reserved for internal use by the broker", method.classId, method.id)
+            } else {
+              val future = (queueSharding ? QueueEntity.PendingDelete(vhost, queue, connection.id)).mapTo[(Boolean, Int)] andThen {
+                case Success(_) =>
+                case Failure(e) => log.error(e, e.getMessage)
+              }
+
+              val callback = getAsyncCallback[(Boolean, Int)] {
+                case (true, nMsgsDeleted) =>
+                  val method = Queue.DeleteOk(nMsgsDeleted)
+                  val command = AMQCommand(channel, method)
+
+                  push(out, command.render)
+                case (false, _) =>
+                  pushConnectionClose(0, ErrorCodes.NOT_ALLOWED, s"Queue $queue is exclusive and is not allowed to access from another connetion", method.classId, method.id)
+              }
+
+              future.foreach(callback.invoke)
             }
-
-            val callback = getAsyncCallback[(Boolean, Int)] {
-              case (true, nMsgsDeleted) =>
-                val method = Queue.DeleteOk(nMsgsDeleted)
-                val command = AMQCommand(channel, method)
-
-                push(out, command.render)
-              case (false, _) =>
-                pushConnectionClose(0, ErrorCodes.NOT_ALLOWED, s"Queue $queue is exclusive and is not allowed to access from another connetion", method.classId, method.id)
-            }
-
-            future.foreach(callback.invoke)
         }
       }
 
       private def receivedBasicMethod(channel: AMQChannel, method: AMQMethod, isLastCommand: Boolean) {
         method match {
           case Basic.Consume(reserved_1, queue, consumerTag, noLocal, noAck, exclusive, nowait, arguments) =>
-            val future = (queueSharding ? QueueEntity.ConsumerStarted(queue, consumerTag, connection.id, channel.id)).mapTo[Boolean] andThen {
+            val future = (queueSharding ? QueueEntity.ConsumerStarted(vhost, queue, consumerTag, connection.id, channel.id)).mapTo[Boolean] andThen {
               case Success(_) =>
               case Failure(e) => log.error(e, e.getMessage)
             }
@@ -1143,7 +1165,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
           case Basic.Cancel(consumerTag, nowait) =>
             channel.getConsumer(consumerTag) match {
               case Some(consumer) =>
-                val future = (queueSharding ? QueueEntity.ConsumerCancelled(consumer.queue, consumer.tag, connection.id, channel.id)).mapTo[Boolean] andThen {
+                val future = (queueSharding ? QueueEntity.ConsumerCancelled(vhost, consumer.queue, consumer.tag, connection.id, channel.id)).mapTo[Boolean] andThen {
                   case Success(_) =>
                   case Failure(e) => log.error(e, e.getMessage)
                 }
@@ -1167,7 +1189,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
           case Basic.Get(reserved_1, queue, autoAck) =>
 
-            val future = (queueSharding ? QueueEntity.Pull(queue, None, connection.id, channel.id, 1, Long.MaxValue, autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
+            val future = (queueSharding ? QueueEntity.Pull(vhost, queue, None, connection.id, channel.id, 1, Long.MaxValue, autoAck)).mapTo[Vector[Long]] flatMap { msgIds =>
               Future.sequence(msgIds map { msgId =>
                 (messageSharding ? MessageEntity.Get(msgId.toString)).mapTo[Option[Message]]
               })

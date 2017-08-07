@@ -13,8 +13,10 @@ object AMQConnection {
     case object OPEN extends State
   }
 }
-class AMQConnection() {
+final class AMQConnection() {
   lazy val id = System.identityHashCode(this)
+
+  var virtualHost: VirtualHost = _
 
   val channel0 = new AMQChannel(this, 0)
   var channels = Map[Int, AMQChannel]()

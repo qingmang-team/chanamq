@@ -14,12 +14,13 @@ import akka.cluster.sharding.ShardRegion
 import akka.pattern.ask
 import akka.util.Timeout
 import chana.mq.amqp
-import chana.mq.amqp.Command
 import chana.mq.amqp.Loaded
 import chana.mq.amqp.Unlock
 import chana.mq.amqp.Msg
 import chana.mq.amqp.Queue
+import chana.mq.amqp.VHostCommand
 import chana.mq.amqp.model.AMQConsumer
+import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.service.ServiceBoard
 import chana.mq.amqp.server.store
 import scala.collection.mutable
@@ -38,11 +39,11 @@ object QueueEntity {
   val typeName: String = "queueEntity"
 
   private val extractEntityId: ShardRegion.ExtractEntityId = {
-    case cmd: Command => (cmd.id, cmd)
+    case cmd: VHostCommand => (cmd.entityId, cmd)
   }
 
   private val extractShardId: ShardRegion.ExtractShardId = {
-    case cmd: Command => (cmd.id.hashCode % 100).toString
+    case cmd: VHostCommand => (cmd.entityId.hashCode % 100).toString
   }
 
   def startSharding(implicit system: ActorSystem) =
@@ -55,20 +56,20 @@ object QueueEntity {
 
   final case class Statistics(existed: Boolean, queueSize: Int, consumerCount: Int)
 
-  final case class Existed(id: String) extends Command
-  final case class Declare(id: String, durable: Boolean, exclusive: Boolean, autoDelete: Boolean, connectionId: Int, ttl: Option[Long]) extends Command
-  final case class ForceDelete(id: String, connectionId: Int) extends Command
-  final case class PendingDelete(id: String, connectionId: Int) extends Command
-  final case class Purge(id: String, connectionId: Int) extends Command
+  final case class Existed(vhost: String, id: String) extends VHostCommand
+  final case class Declare(vhost: String, id: String, durable: Boolean, exclusive: Boolean, autoDelete: Boolean, connectionId: Int, ttl: Option[Long]) extends VHostCommand
+  final case class ForceDelete(vhost: String, id: String, connectionId: Int) extends VHostCommand
+  final case class PendingDelete(vhost: String, id: String, connectionId: Int) extends VHostCommand
+  final case class Purge(vhost: String, id: String, connectionId: Int) extends VHostCommand
 
-  final case class IsDurable(id: String) extends Command
-  final case class Push(id: String, msgs: Vector[Msg], connectionId: Int) extends Command
-  final case class Pull(id: String, consumerTag: Option[String], connectionId: Int, channelId: Int, prefetchCount: Int, prefetchSize: Long, autoAck: Boolean) extends Command
-  final case class Acked(id: String, msgIds: collection.Set[Long]) extends Command
-  final case class Requeue(id: String, msgIds: collection.Set[Long]) extends Command
+  final case class IsDurable(vhost: String, id: String) extends VHostCommand
+  final case class Push(vhost: String, id: String, msgs: Vector[Msg], connectionId: Int) extends VHostCommand
+  final case class Pull(vhost: String, id: String, consumerTag: Option[String], connectionId: Int, channelId: Int, prefetchCount: Int, prefetchSize: Long, autoAck: Boolean) extends VHostCommand
+  final case class Acked(vhost: String, id: String, msgIds: collection.Set[Long]) extends VHostCommand
+  final case class Requeue(vhost: String, id: String, msgIds: collection.Set[Long]) extends VHostCommand
 
-  final case class ConsumerStarted(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
-  final case class ConsumerCancelled(id: String, tag: String, connectionId: Int, channelId: Int) extends Command
+  final case class ConsumerStarted(vhost: String, id: String, tag: String, connectionId: Int, channelId: Int) extends VHostCommand
+  final case class ConsumerCancelled(vhost: String, id: String, tag: String, connectionId: Int, channelId: Int) extends VHostCommand
 
   /** Event publish to "amqp.queue" */
   final case class QueueDeleted(queue: String)
@@ -157,10 +158,10 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
   }
 
   def ready: Receive = {
-    case QueueEntity.Existed(_) =>
+    case QueueEntity.Existed(_, _) =>
       sender() ! existed
 
-    case QueueEntity.Declare(_, durable, exclusive, autoDelete, connectionId, ttl) =>
+    case QueueEntity.Declare(_, _, durable, exclusive, autoDelete, connectionId, ttl) =>
       val commander = sender()
       this.isPassiveCreated = false
 
@@ -168,10 +169,10 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         commander ! stats
       }
 
-    case QueueEntity.IsDurable(_) =>
+    case QueueEntity.IsDurable(_, _) =>
       sender() ! isDurable
 
-    case QueueEntity.ForceDelete(_, connectionId) =>
+    case QueueEntity.ForceDelete(_, _, connectionId) =>
       val commander = sender()
 
       delete(connectionId, isForce = true) andThen {
@@ -182,7 +183,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         case (false, _) =>
       }
 
-    case QueueEntity.PendingDelete(_, connectionId) =>
+    case QueueEntity.PendingDelete(_, _, connectionId) =>
       val commander = sender()
 
       delete(connectionId, isForce = false) andThen {
@@ -193,7 +194,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         case (false, _) =>
       }
 
-    case m @ QueueEntity.Purge(_, connectionId) =>
+    case m @ QueueEntity.Purge(_, _, connectionId) =>
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
@@ -214,7 +215,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case m @ QueueEntity.ConsumerStarted(_, tag, connectionId, channelId) =>
+    case m @ QueueEntity.ConsumerStarted(_, _, tag, connectionId, channelId) =>
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
@@ -234,7 +235,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case m @ QueueEntity.ConsumerCancelled(_, tag, connectionId, channelId) =>
+    case m @ QueueEntity.ConsumerCancelled(_, _, tag, connectionId, channelId) =>
       val commander = sender()
 
       if (isExclusive && this.connectionId != connectionId) {
@@ -269,7 +270,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case m @ QueueEntity.Push(_, msgs, connectionId) =>
+    case m @ QueueEntity.Push(_, _, msgs, connectionId) =>
       log.debug(s"Got $m")
       val commander = sender()
 
@@ -316,7 +317,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         case Failure(e) => log.error(e, e.getMessage)
       }
 
-    case m @ QueueEntity.Pull(_, consumerTag, connectionId, channelId, prefetchCount, prefetchSize, autoAck) =>
+    case m @ QueueEntity.Pull(_, _, consumerTag, connectionId, channelId, prefetchCount, prefetchSize, autoAck) =>
       log.debug(s"Got $m")
       val commander = sender()
 
@@ -393,7 +394,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
         }
       }
 
-    case m @ QueueEntity.Acked(_, msgIds) =>
+    case m @ QueueEntity.Acked(_, _, msgIds) =>
       log.debug(s"Got $m")
       val commander = sender()
 
@@ -413,7 +414,7 @@ final class QueueEntity extends Actor with Stash with ActorLogging {
           log.error(ex, ex.getMessage)
       }
 
-    case m @ QueueEntity.Requeue(_, msgIds) =>
+    case m @ QueueEntity.Requeue(_, _, msgIds) =>
       log.debug(s"Got $m")
       val commander = sender()
 

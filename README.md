@@ -8,6 +8,8 @@
 
  * ChanaMQ is still in the alpha phase.
  * Methods/Features are not supported yet:
+   * Virtual host(partically)
+   * ~~Native ssl/tls~~
    * Connection.SecureOk / Connection.Blocked / Connection.Unblocked
    * ~~Channel.Flow~~
    * Exchange.Bind / Exchange.Unbind

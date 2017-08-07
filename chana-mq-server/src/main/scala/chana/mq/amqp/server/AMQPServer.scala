@@ -4,7 +4,6 @@ import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.event.LoggingAdapter
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.BidiFlow
 import akka.stream.scaladsl.Flow
 import akka.util.ByteString
 import chana.mq.amqp.Amqp
@@ -78,8 +77,7 @@ object AMQPServer {
       sslContext.init(kmf.getKeyManagers, tmf.getTrustManagers, new SecureRandom())
       val amqps = ConnectionContext.amqps(sslContext)
 
-      Amqp().setDefaultServerAmqpContext(amqps)
-      Amqp().startServer(amqpsHost, amqpsPort)(serverLogic)
+      Amqp().startServer(amqpsHost, amqpsPort, connectionContext = amqps)(serverLogic)
     }
   }
 

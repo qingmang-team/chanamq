@@ -15,10 +15,11 @@ import akka.cluster.sharding.ShardRegion
 import akka.pattern.ask
 import akka.util.Timeout
 import chana.mq.amqp.Loaded
-import chana.mq.amqp.Command
 import chana.mq.amqp.Exchange
 import chana.mq.amqp.Msg
+import chana.mq.amqp.VHostCommand
 import chana.mq.amqp.model.AMQP
+import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.engine.DirectMatcher
 import chana.mq.amqp.server.engine.FanoutMatcher
 import chana.mq.amqp.server.engine.QueueMatcher
@@ -68,11 +69,11 @@ object ExchangeEntity {
   val typeName: String = "exchangeEntity"
 
   private val extractEntityId: ShardRegion.ExtractEntityId = {
-    case cmd: Command => (cmd.id, cmd)
+    case cmd: VHostCommand => (cmd.entityId, cmd)
   }
 
   private val extractShardId: ShardRegion.ExtractShardId = {
-    case cmd: Command => (cmd.id.hashCode % 100).toString
+    case cmd: VHostCommand => (cmd.entityId.hashCode % 100).toString
   }
 
   def startSharding(implicit system: ActorSystem) =
@@ -83,13 +84,13 @@ object ExchangeEntity {
 
   val Topic = "amqp.exchange"
 
-  final case class Existed(id: String) extends Command
-  final case class Declare(id: String, tpe: String, durable: Boolean, autoDelete: Boolean, internal: Boolean, arguments: Map[String, Any]) extends Command
-  final case class Delete(id: String, ifUnused: Boolean, connectionId: Int) extends Command
-  final case class QueueBind(id: String, queue: String, routingKey: String, arguments: Map[String, Any]) extends Command
-  final case class QueueUnbind(id: String, queue: String, routingKey: String, arguments: Map[String, Any]) extends Command
-  final case class QueueUnbindAll(id: String, queue: String) extends Command
-  final case class Publishs(id: String, publishes: List[Publish], connectionId: Int) extends Command
+  final case class Existed(vhost: String, id: String) extends VHostCommand
+  final case class Declare(vhost: String, id: String, tpe: String, durable: Boolean, autoDelete: Boolean, internal: Boolean, arguments: Map[String, Any]) extends VHostCommand
+  final case class Delete(vhost: String, id: String, ifUnused: Boolean, connectionId: Int) extends VHostCommand
+  final case class QueueBind(vhost: String, id: String, queue: String, routingKey: String, arguments: Map[String, Any]) extends VHostCommand
+  final case class QueueUnbind(vhost: String, id: String, queue: String, routingKey: String, arguments: Map[String, Any]) extends VHostCommand
+  final case class QueueUnbindAll(vhost: String, id: String, queue: String) extends VHostCommand
+  final case class Publishs(vhost: String, id: String, publishes: List[Publish], connectionId: Int) extends VHostCommand
 
   final case class Publish(msgId: Long, routingKey: String, mandatory: Boolean, immediate: Boolean, bodySize: Int, isMsgPersist: Boolean, ttl: Option[Long])
 
@@ -188,10 +189,10 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
       // message published via mediator's ExchangeEntity.Topic
       queueUnbind(queue)
 
-    case ExchangeEntity.Existed(id) =>
+    case ExchangeEntity.Existed(_, _) =>
       sender() ! existed
 
-    case ExchangeEntity.Declare(id, tpe, durable, autoDelete, internal, arguments) =>
+    case ExchangeEntity.Declare(_, _, tpe, durable, autoDelete, internal, arguments) =>
       val commander = sender()
       this.isPassiveCreated = false
 
@@ -222,13 +223,13 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
         commander ! true
       }
 
-    case ExchangeEntity.Delete(_, ifUnused, connectionId) =>
+    case ExchangeEntity.Delete(vhost, _, ifUnused, connectionId) =>
       val commander = sender()
       if (ifUnused && subscriptions.nonEmpty) {
         commander ! false
       } else {
         Future.sequence(subscriptions.keys map { queue =>
-          (queueSharding ? QueueEntity.ForceDelete(queue, connectionId)).mapTo[(Boolean, Int)]
+          (queueSharding ? QueueEntity.ForceDelete(vhost, queue, connectionId)).mapTo[(Boolean, Int)]
         }) flatMap { xs =>
           val persist = if (isDurable) {
             storeService.deleteExchange(id)
@@ -244,7 +245,7 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
         }
       }
 
-    case bind @ ExchangeEntity.QueueBind(_, queue, routingKey, arguments) =>
+    case bind @ ExchangeEntity.QueueBind(_, _, queue, routingKey, arguments) =>
       val commander = sender()
 
       val persist = queueBind(bind) flatMap { _ =>
@@ -259,7 +260,7 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
         commander ! true
       }
 
-    case ExchangeEntity.QueueUnbind(_, queue, routingKey, arguments) =>
+    case ExchangeEntity.QueueUnbind(_, _, queue, routingKey, arguments) =>
       val commander = sender()
 
       queueUnbind(queue, routingKey) map {
@@ -270,17 +271,17 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
           commander ! true
       }
 
-    case ExchangeEntity.Publishs(_, publishes, connectionId) =>
+    case ExchangeEntity.Publishs(vhost, _, publishes, connectionId) =>
       val commander = sender()
 
-      publish(publishes, connectionId) map { results =>
+      publish(vhost, publishes, connectionId) map { results =>
         commander ! results
       }
 
     case _ =>
   }
 
-  private def publish(publishes: List[ExchangeEntity.Publish], connectionId: Int): Future[Vector[(Long, Boolean, Boolean)]] = {
+  private def publish(vhost: String, publishes: List[ExchangeEntity.Publish], connectionId: Int): Future[Vector[(Long, Boolean, Boolean)]] = {
     log.debug(s"publishes: $publishes")
 
     val now = System.currentTimeMillis
@@ -310,7 +311,7 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
         (messageSharding ? msgRef).mapTo[Boolean]
     }) flatMap { _ =>
       Future.sequence(queueToMsgs map {
-        case (queue, msgs) => (queueSharding ? QueueEntity.Push(queue, msgs, connectionId)).mapTo[Boolean] map (hasConsumer => (queue, hasConsumer))
+        case (queue, msgs) => (queueSharding ? QueueEntity.Push(vhost, queue, msgs, connectionId)).mapTo[Boolean] map (hasConsumer => (queue, hasConsumer))
       })
     } map { queueToConsumerCount =>
       val queuesWithConsumer = queueToConsumerCount.collect {
@@ -330,7 +331,7 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
     binds += bind
 
     log.info(s"$id, tpe: $tpe, macther: $queueMatcher")
-    (queueSharding ? QueueEntity.IsDurable(bind.queue)).mapTo[Boolean] map { isQueueDutable =>
+    (queueSharding ? QueueEntity.IsDurable(bind.vhost, bind.queue)).mapTo[Boolean] map { isQueueDutable =>
       val sub = queueMatcher.subscribe(bind.routingKey, ExchangeEntity.TopicSubscriber(bind.queue, isQueueDutable))
       subscriptions.getOrElseUpdate(bind.queue, new mutable.ListBuffer()) += sub
       log.debug(s"matcher after '${bind.routingKey}' - '${bind.queue}': ${queueMatcher}")

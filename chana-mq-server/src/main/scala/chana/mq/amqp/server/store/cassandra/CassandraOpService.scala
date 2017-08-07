@@ -24,6 +24,7 @@ import chana.mq.amqp.Msg
 import chana.mq.amqp.Queue
 import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.model.BasicProperties
+import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.store
 import scala.collection.mutable
 import scala.collection.JavaConverters._
@@ -630,6 +631,11 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   def selectExchange(id: String): Future[Option[Exchange]] = {
     val start = System.currentTimeMillis
+    val (vhost, exchangeId) = id.split(VirtualHost.SEP) match {
+      case Array(vhost, exchangeId, _*) => (vhost, exchangeId)
+      case _                            => ("", id)
+    }
+
     execute(_selectExchange(id)) map { rs =>
       val raws = rs.iterator
       if (raws.hasNext) {
@@ -654,7 +660,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
             val routingKey = raw.getString("key")
             val args = raw.getMap("args", classOf[String], classOf[String])
             import scala.collection.JavaConverters._
-            binds += ExchangeEntity.QueueBind(id, queue, routingKey, args.asScala.toMap)
+            binds += ExchangeEntity.QueueBind(vhost, exchangeId, queue, routingKey, args.asScala.toMap)
           }
           Some(Exchange(tpe, isDurable, isAutoDelete, isInternal, args.asScala.toMap, binds.toList))
         }
