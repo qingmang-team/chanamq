@@ -144,6 +144,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         Future.sequence(connection.exclusiveQueues map { queue =>
           (queueSharding ? QueueEntity.ForceDelete(vhost, queue, connection.id)).mapTo[Boolean]
         })
+      } andThen {
+        case Success(_) =>
+        case Failure(e) => log.error(e, e.getMessage)
       }
     }
 
@@ -152,6 +155,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         channel.clearConsumers
         connection.channels -= channel.id
         done
+      } andThen {
+        case Success(_) =>
+        case Failure(e) => log.error(e, e.getMessage)
       }
     }
 
@@ -215,6 +221,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
                 case _ =>
                   log.warning(s"recv: $stash")
+
                   push(out, ByteString(ProtocolVersion.V_0_91.protocolHeader))
               }
               stash = rest
@@ -266,8 +273,14 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
         grab(in) match {
           case Left(Disconnect) =>
             log.info(s"$id Tcp upstream disconnected, going to close all channels")
-            completeAndCloseAllChannels()
-            completeStage()
+
+            val future = completeAndCloseAllChannels()
+
+            val callback = getAsyncCallback[Iterable[Boolean]] { _ =>
+              completeStage()
+            }
+
+            future.foreach(callback.invoke)
 
           case Left(Tick) =>
             pushHeatbeatOrPendingOrMessagesOrPull()
@@ -878,14 +891,10 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             }
 
           case Connection.Close(replyCode, replyText, classId, methodId) =>
-            val future = completeAndCloseAllChannels() andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
-            }
+            val future = completeAndCloseAllChannels()
 
             val callback = getAsyncCallback[Iterable[Boolean]] { _ =>
-              val method = Connection.CloseOk
-              val command = AMQCommand(connection.channel0, method)
+              val command = AMQCommand(connection.channel0, Connection.CloseOk)
 
               push(out, command.render)
               completeStage()
@@ -897,7 +906,13 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             log.info(s"TODO Method not be processed: ${method.getClass.getName}")
 
           case Connection.CloseOk =>
-            log.info(s"TODO Method not be processed: ${method.getClass.getName}")
+            val future = completeAndCloseAllChannels()
+
+            val callback = getAsyncCallback[Iterable[Boolean]] { _ =>
+              completeStage()
+            }
+
+            future.foreach(callback.invoke)
         }
       }
 
@@ -922,10 +937,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             }
 
           case Channel.Close(replyCode, replyText, classId, methodId) =>
-            val future = completeAndCloseChannel(channel) andThen {
-              case Success(_) =>
-              case Failure(e) => log.error(e, e.getMessage)
-            }
+            val future = completeAndCloseChannel(channel)
 
             val callback = getAsyncCallback[Iterable[Boolean]] { _ =>
               val command = AMQCommand(channel, Channel.CloseOk)
@@ -1045,8 +1057,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
                 if (passive && !statis.existed) {
                   pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, s"Queue $queueName does not exists when passive declared", method.classId, method.id)
                 } else {
-                  val method = Queue.DeclareOk(queueName, statis.queueSize, statis.consumerCount)
-                  val command = AMQCommand(channel, method)
+                  val command = AMQCommand(channel, Queue.DeclareOk(queueName, statis.queueSize, statis.consumerCount))
 
                   push(out, command.render)
                 }
@@ -1065,8 +1076,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               }
 
               val callback = getAsyncCallback[Boolean] { _ =>
-                val method = Queue.BindOk
-                val command = AMQCommand(channel, method)
+                val command = AMQCommand(channel, Queue.BindOk)
 
                 push(out, command.render)
               }
@@ -1084,8 +1094,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
               }
 
               val callback = getAsyncCallback[Boolean] { _ =>
-                val method = Queue.UnbindOk
-                val command = AMQCommand(channel, method)
+                val command = AMQCommand(channel, Queue.UnbindOk)
 
                 push(out, command.render)
               }
@@ -1104,8 +1113,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
               val callback = getAsyncCallback[(Boolean, Int)] {
                 case (true, nMsgsPurged) =>
-                  val method = Queue.PurgeOk(nMsgsPurged)
-                  val command = AMQCommand(channel, method)
+                  val command = AMQCommand(channel, Queue.PurgeOk(nMsgsPurged))
 
                   push(out, command.render)
                 case (false, _) =>
@@ -1126,8 +1134,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
               val callback = getAsyncCallback[(Boolean, Int)] {
                 case (true, nMsgsDeleted) =>
-                  val method = Queue.DeleteOk(nMsgsDeleted)
-                  val command = AMQCommand(channel, method)
+                  val command = AMQCommand(channel, Queue.DeleteOk(nMsgsDeleted))
 
                   push(out, command.render)
                 case (false, _) =>

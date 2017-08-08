@@ -79,7 +79,7 @@ class AmqpExtention(private val config: Config)(implicit val system: ActorSystem
   )(serverLogic: ServerLogic)(implicit mat: Materializer) {
     val connectionSink = Sink.foreach[Tcp.IncomingConnection] { incomingConn =>
       system.log.info(s"Incoming connection from: ${incomingConn.remoteAddress}")
-      
+
       // we should build a new layer instance for each incomingConnection, so do it here
       val sslTlsLayer = sslTlsStage(connectionContext, TLSRole.server)
       val serverLayer = serverLogic(settings, log)
