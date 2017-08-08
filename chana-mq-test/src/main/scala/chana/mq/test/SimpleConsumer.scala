@@ -17,7 +17,7 @@ object SimpleConsumer {
     //factory.setVirtualHost(virtualHost)
     //factory.setHost(hostName)
     //factory.setPort(portNumber)
-    factory.setVirtualHost("vhost1")
+    //factory.setVirtualHost("vhost1")
     val conn = factory.newConnection()
 
     val channel = conn.createChannel()

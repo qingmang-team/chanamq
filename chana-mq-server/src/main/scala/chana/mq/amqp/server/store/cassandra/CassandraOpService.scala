@@ -18,12 +18,12 @@ import java.io.DataOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import chana.mq.amqp.Exchange
-import chana.mq.amqp.Message
-import chana.mq.amqp.Msg
-import chana.mq.amqp.Queue
-import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.model.BasicProperties
+import chana.mq.amqp.model.Bind
+import chana.mq.amqp.model.Exchange
+import chana.mq.amqp.model.Message
+import chana.mq.amqp.model.Msg
+import chana.mq.amqp.model.Queue
 import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.store
 import scala.collection.mutable
@@ -310,12 +310,6 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   val deleteExchangeStmt = session.prepare("DELETE FROM exchanges WHERE id = ?;")
   val selectExchangeStmt = session.prepare("SELECT * FROM exchanges WHERE id = ?;")
 
-  val insertExchangeBindStmt = session.prepare("INSERT INTO exchange_binds (id, queue, key, args) VALUES (?, ?, ?, ?);")
-  val deleteExchangeBindStmt = session.prepare("DELETE FROM exchange_binds WHERE id = ? AND queue = ? AND key = ?;")
-  val deleteExchangeBindsStmt = session.prepare("DELETE FROM exchange_binds WHERE id = ?;")
-  val deleteExchangeBindsOfQueueStmt = session.prepare("DELETE FROM exchange_binds WHERE id = ? AND queue = ?;")
-  val selectExchangeBindStmt = session.prepare("SELECT * FROM exchange_binds WHERE id = ?;")
-
   private def _selectExchange(id: String) = selectExchangeStmt.bind(id)
   private def _deleteExchange(id: String) = deleteExchangeStmt.bind(id)
   private def _insertExchange(id: String, tpe: String, isDurable: Boolean, isAutoDelete: Boolean, isInternal: Boolean, args: java.util.Map[String, Any]) = {
@@ -329,18 +323,43 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
     bs
   }
 
-  private def _selectExchangeBind(id: String) = selectExchangeBindStmt.bind(id)
-  private def _deleteExchangeBind(id: String, queue: String, routingKey: String) = deleteExchangeBindStmt.bind(id, queue, routingKey)
-  private def _deleteExchangeBinds(id: String) = deleteExchangeBindsStmt.bind(id)
-  private def _deleteExchangeBindsOfQueue(id: String, queue: String) = deleteExchangeBindsOfQueueStmt.bind(id, queue)
-  private def _insertExchangeBind(id: String, queue: String, routingKey: String, args: java.util.Map[String, Any]) = {
-    val bs = new BoundStatement(insertExchangeBindStmt)
+  // binds
+
+  val insertBindStmt = session.prepare("INSERT INTO binds (id, queue, key, args) VALUES (?, ?, ?, ?);")
+  val deleteBindStmt = session.prepare("DELETE FROM binds WHERE id = ? AND queue = ? AND key = ?;")
+  val deleteBindsStmt = session.prepare("DELETE FROM binds WHERE id = ?;")
+  val deleteBindsOfQueueStmt = session.prepare("DELETE FROM binds WHERE id = ? AND queue = ?;")
+  val selectBindStmt = session.prepare("SELECT * FROM binds WHERE id = ?;")
+
+  private def _selectBind(id: String) = selectBindStmt.bind(id)
+  private def _deleteBind(id: String, queue: String, routingKey: String) = deleteBindStmt.bind(id, queue, routingKey)
+  private def _deleteBinds(id: String) = deleteBindsStmt.bind(id)
+  private def _deleteBindsOfQueue(id: String, queue: String) = deleteBindsOfQueueStmt.bind(id, queue)
+  private def _insertBind(id: String, queue: String, routingKey: String, args: java.util.Map[String, Any]) = {
+    val bs = new BoundStatement(insertBindStmt)
     bs.setString(0, id)
     bs.setString(1, queue)
     bs.setString(2, routingKey)
     bs.setMap(3, args)
     bs
   }
+
+  // vhosts
+
+  val insertVhostStmt = session.prepare("INSERT INTO vhosts (id, active) VALUES (?, ?);")
+  val deleteVhostStmt = session.prepare("DELETE FROM vhosts WHERE id = ?;")
+  val selectVhostStmt = session.prepare("SELECT * FROM vhosts WHERE id = ?;")
+
+  private def _selectVhost(id: String) = selectVhostStmt.bind(id)
+  private def _deleteVhost(id: String) = deleteVhostStmt.bind(id)
+  private def _insertVhost(id: String, isActive: Boolean) = {
+    val bs = new BoundStatement(insertExchangeStmt)
+    bs.setString(0, id)
+    bs.setBool(1, isActive)
+    bs
+  }
+
+  // --- internal apis
 
   private def doDeleteQueue(id: String): Future[Unit] = {
     execute(_deleteQueueMeta(id)) flatMap { _ =>
@@ -623,7 +642,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   def insertExchangeBind(id: String, queue: String, routingKey: String, args: java.util.Map[String, Any]) = {
     val start = System.currentTimeMillis
-    execute(_insertExchangeBind(id, queue, routingKey, args)) map (_ => ()) andThen {
+    execute(_insertBind(id, queue, routingKey, args)) map (_ => ()) andThen {
       case Success(_) => log.info(s"Inserted exchange of $id in ${System.currentTimeMillis - start}ms")
       case Failure(e) => log.error(e, s"Failed to insert exchange of $id")
     }
@@ -631,11 +650,6 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   def selectExchange(id: String): Future[Option[Exchange]] = {
     val start = System.currentTimeMillis
-    val (vhost, exchangeId) = id.split(VirtualHost.SEP) match {
-      case Array(vhost, exchangeId, _*) => (vhost, exchangeId)
-      case _                            => ("", id)
-    }
-
     execute(_selectExchange(id)) map { rs =>
       val raws = rs.iterator
       if (raws.hasNext) {
@@ -651,8 +665,13 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
       }
     } flatMap {
       case Some((tpe, isDurable, isAutoDelete, isInternal, args)) =>
-        execute(_selectExchangeBind(id)) map { rs =>
-          val binds = new mutable.ListBuffer[ExchangeEntity.QueueBind]()
+        execute(_selectBind(id)) map { rs =>
+          val (vhost, exchangeId) = id.split(VirtualHost.sep) match {
+            case Array(vhost, exchangeId, _*) => (vhost, exchangeId)
+            case _                            => ("", id)
+          }
+
+          val binds = new mutable.ListBuffer[Bind]()
           val raws = rs.iterator
           while (raws.hasNext) {
             val raw = raws.next()
@@ -660,7 +679,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
             val routingKey = raw.getString("key")
             val args = raw.getMap("args", classOf[String], classOf[String])
             import scala.collection.JavaConverters._
-            binds += ExchangeEntity.QueueBind(vhost, exchangeId, queue, routingKey, args.asScala.toMap)
+            binds += Bind(vhost, exchangeId, queue, routingKey, args.asScala.toMap)
           }
           Some(Exchange(tpe, isDurable, isAutoDelete, isInternal, args.asScala.toMap, binds.toList))
         }
@@ -674,7 +693,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   def deleteExchangeBind(id: String, queue: String, routingKey: String) = {
     val start = System.currentTimeMillis
-    execute(_deleteExchangeBind(id, queue, routingKey)) map (_ => ()) andThen {
+    execute(_deleteBind(id, queue, routingKey)) map (_ => ()) andThen {
       case Success(_) => log.info(s"Deleted exchange bind of $id $queue $routingKey in ${System.currentTimeMillis - start}ms")
       case Failure(e) => log.error(e, s"Failed to delete exchange bind of $id $queue $routingKey")
     }
@@ -682,7 +701,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
 
   def deleteExchangeBindsOfQueue(id: String, queue: String) = {
     val start = System.currentTimeMillis
-    execute(_deleteExchangeBindsOfQueue(id, queue)) map (_ => ()) andThen {
+    execute(_deleteBindsOfQueue(id, queue)) map (_ => ()) andThen {
       case Success(_) => log.info(s"Deleted exchange binds of $id $queue in ${System.currentTimeMillis - start}ms")
       case Failure(e) => log.error(e, s"Failed to delete exchange binds of $id $queue")
     }
@@ -691,10 +710,43 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   def deleteExchange(id: String) = {
     val start = System.currentTimeMillis
     execute(_deleteExchange(id)) flatMap { _ =>
-      execute(_deleteExchangeBinds(id))
+      execute(_deleteBinds(id))
     } map (_ => ()) andThen {
       case Success(_) => log.info(s"Deleted exchange of $id in ${System.currentTimeMillis - start}ms")
       case Failure(e) => log.error(e, s"Failed to delete exchange of $id")
+    }
+  }
+
+  def insertVhost(id: String, isActive: Boolean) = {
+    val start = System.currentTimeMillis
+    execute(_insertVhost(id, isActive)) map (_ => ()) andThen {
+      case Success(_) => log.info(s"Inserted vhost of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to insert vhost of $id")
+    }
+  }
+
+  def selectVhost(id: String): Future[Option[VirtualHost]] = {
+    val start = System.currentTimeMillis
+    execute(_selectVhost(id)) map { rs =>
+      val raws = rs.iterator
+      if (raws.hasNext) {
+        val raw = raws.next
+        val isActive = raw.getBool("active")
+        Some(VirtualHost(id, isActive))
+      } else {
+        None
+      }
+    } andThen {
+      case Success(_) => log.info(s"Selected vhost of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to select vhost of $id")
+    }
+  }
+
+  def deleteVhost(id: String) = {
+    val start = System.currentTimeMillis
+    execute(_deleteVhost(id)) map (_ => ()) andThen {
+      case Success(_) => log.info(s"Deleted vhost of $id in ${System.currentTimeMillis - start}ms")
+      case Failure(e) => log.error(e, s"Failed to delete vhost of $id")
     }
   }
 

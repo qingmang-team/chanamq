@@ -15,11 +15,11 @@ import akka.cluster.sharding.ShardRegion
 import akka.pattern.ask
 import akka.util.Timeout
 import chana.mq.amqp.Loaded
-import chana.mq.amqp.Exchange
-import chana.mq.amqp.Msg
 import chana.mq.amqp.VHostCommand
+import chana.mq.amqp.model.Bind
+import chana.mq.amqp.model.Exchange
+import chana.mq.amqp.model.Msg
 import chana.mq.amqp.model.AMQP
-import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.engine.DirectMatcher
 import chana.mq.amqp.server.engine.FanoutMatcher
 import chana.mq.amqp.server.engine.QueueMatcher
@@ -96,6 +96,8 @@ object ExchangeEntity {
 
   final case class TopicSubscriber(queue: String, isDurable: Boolean) extends Subscriber
 
+  def toQueueBind(bind: Bind) = QueueBind(bind.vhost, bind.exchange, bind.queue, bind.routingKey, bind.arguments)
+
   def isDefaultExchange(exchange: String) =
     exchange == null || exchange == ""
 }
@@ -150,8 +152,9 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
           case AMQP.ExchangeType.TOPIC  => new TrieMatcher()
           case _                        => new TrieMatcher()
         }
+        binds.map(ExchangeEntity.toQueueBind)
 
-        Future.sequence(binds map queueBind) map (_ => ())
+        Future.sequence(binds map ExchangeEntity.toQueueBind map queueBind) map (_ => ())
 
       case None =>
         Future.successful(())
@@ -331,8 +334,8 @@ final class ExchangeEntity() extends Actor with Stash with ActorLogging {
     binds += bind
 
     log.info(s"$id, tpe: $tpe, macther: $queueMatcher")
-    (queueSharding ? QueueEntity.IsDurable(bind.vhost, bind.queue)).mapTo[Boolean] map { isQueueDutable =>
-      val sub = queueMatcher.subscribe(bind.routingKey, ExchangeEntity.TopicSubscriber(bind.queue, isQueueDutable))
+    (queueSharding ? QueueEntity.IsDurable(bind.vhost, bind.queue)).mapTo[Boolean] map { isQueueDurable =>
+      val sub = queueMatcher.subscribe(bind.routingKey, ExchangeEntity.TopicSubscriber(bind.queue, isQueueDurable))
       subscriptions.getOrElseUpdate(bind.queue, new mutable.ListBuffer()) += sub
       log.debug(s"matcher after '${bind.routingKey}' - '${bind.queue}': ${queueMatcher}")
     }

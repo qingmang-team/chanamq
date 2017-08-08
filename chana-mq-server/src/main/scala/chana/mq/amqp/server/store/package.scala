@@ -1,10 +1,11 @@
 package chana.mq.amqp.server
 
-import chana.mq.amqp.Exchange
-import chana.mq.amqp.Message
-import chana.mq.amqp.Msg
-import chana.mq.amqp.Queue
 import chana.mq.amqp.model.BasicProperties
+import chana.mq.amqp.model.Exchange
+import chana.mq.amqp.model.Message
+import chana.mq.amqp.model.Msg
+import chana.mq.amqp.model.Queue
+import chana.mq.amqp.model.VirtualHost
 import scala.concurrent.Future
 
 package object store {
@@ -35,5 +36,9 @@ package object store {
     def deleteExchangeBind(id: String, queue: String, routingKey: String): Future[Unit]
     def deleteExchangeBindsOfQueue(id: String, queue: String): Future[Unit]
     def deleteExchange(id: String): Future[Unit]
+
+    def insertVhost(id: String, isActive: Boolean): Future[Unit]
+    def selectVhost(id: String): Future[Option[VirtualHost]]
+    def deleteVhost(id: String): Future[Unit]
   }
 }

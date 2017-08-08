@@ -34,7 +34,7 @@ trait SaslMechanism {
    */
   def handleChallenge(challenge: LongString, username: String, password: String): LongString
 
-  def handleResponse(response: Array[Byte]): Any
+  def handleResponse(response: Array[Byte]): String
 }
 
 final class PlainMechanism extends SaslMechanism {
@@ -66,7 +66,7 @@ final class PlainMechanism extends SaslMechanism {
       // TODO: should not get pwd as a String but as a char array...
       val passwordLen = response.length - authcidNullPos - 1
       val password = new String(response, authcidNullPos + 1, passwordLen, "UTF-8")
-      (username, password)
+      username
     } catch {
       case e: UnsupportedEncodingException =>
         throw new RuntimeException("JVM does not support UTF8", e)
@@ -94,5 +94,5 @@ final class ExternalMechanism extends SaslMechanism {
     LongString.asLongString("")
   }
 
-  def handleResponse(response: Array[Byte]) = ()
+  def handleResponse(response: Array[Byte]) = ""
 }

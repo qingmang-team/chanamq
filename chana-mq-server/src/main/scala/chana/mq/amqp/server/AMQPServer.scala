@@ -12,6 +12,7 @@ import chana.mq.amqp.ServerSettings
 import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.entity.MessageEntity
 import chana.mq.amqp.entity.QueueEntity
+import chana.mq.amqp.entity.VhostEntity
 import chana.mq.amqp.server.engine.ServerBluePrint
 import chana.mq.amqp.server.service.GlobalNodeIdService
 import java.nio.file.Files
@@ -34,6 +35,7 @@ object AMQPServer {
   GlobalNodeIdService.start(system, Some("entity"))
   GlobalNodeIdService.startProxy(system, Some("entity"))
 
+  VhostEntity.startSharding(system)
   ExchangeEntity.startSharding(system)
   QueueEntity.startSharding(system)
   MessageEntity.startSharding(system)

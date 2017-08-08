@@ -83,11 +83,18 @@ CREATE TABLE IF NOT EXISTS exchanges (
   PRIMARY KEY (id)
 );
 
-CREATE TABLE IF NOT EXISTS exchange_binds (
+CREATE TABLE IF NOT EXISTS binds (
   id text, -- exchange id/name
   queue text,
   key text, -- routing key
   args map<text, text>,
 
   PRIMARY KEY (id, queue, key)
+);
+
+CREATE TABLE IF NOT EXISTS vhosts (
+  id text, -- exchange id/name
+  active boolean,
+
+  PRIMARY KEY (id)
 );

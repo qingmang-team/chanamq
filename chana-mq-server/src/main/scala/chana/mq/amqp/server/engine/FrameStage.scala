@@ -15,12 +15,12 @@ import akka.stream.stage.TimerGraphStageLogic
 import akka.util.ByteString
 import akka.util.Timeout
 import chana.mq.amqp
-import chana.mq.amqp.Message
 import chana.mq.amqp.engine.CommandAssembler
 import chana.mq.amqp.engine.FrameParser
 import chana.mq.amqp.entity.ExchangeEntity
 import chana.mq.amqp.entity.MessageEntity
 import chana.mq.amqp.entity.QueueEntity
+import chana.mq.amqp.entity.VhostEntity
 import chana.mq.amqp.method.AMQClass
 import chana.mq.amqp.method.Access
 import chana.mq.amqp.method.Basic
@@ -38,6 +38,7 @@ import chana.mq.amqp.model.AMQP
 import chana.mq.amqp.model.ErrorCodes
 import chana.mq.amqp.model.Frame
 import chana.mq.amqp.model.LongString
+import chana.mq.amqp.model.Message
 import chana.mq.amqp.model.ProtocolVersion
 import chana.mq.amqp.model.VirtualHost
 import chana.mq.amqp.server.service.ServiceBoard
@@ -57,7 +58,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
 
   private val log = Logging(system, this.getClass)
 
-  private lazy val connection = {
+  private val connection = {
     val conn = new AMQConnection()
     val connConfig = system.settings.config.getConfig("chana.mq.amqp.connection")
 
@@ -86,6 +87,7 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
   private def exchangeSharding = ClusterSharding(system).shardRegion(ExchangeEntity.typeName)
   private def messageSharding = ClusterSharding(system).shardRegion(MessageEntity.typeName)
   private def queueSharding = ClusterSharding(system).shardRegion(QueueEntity.typeName)
+  private def vhostSharding = ClusterSharding(system).shardRegion(VhostEntity.typeName)
 
   private val serviceBoard = ServiceBoard(system)
   def idService = serviceBoard.idService
@@ -807,8 +809,9 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             } else {
               SaslMechanism.getSaslMechanism(mechanism.split(" ")) match {
                 case Some(saslMechanism) =>
-                  val x = saslMechanism.handleResponse(response.bytes)
-                  log.info(x.toString)
+                  val user = saslMechanism.handleResponse(response.bytes)
+                  log.info(s"$id user=$user")
+                  connection.user = user
 
                   val command = AMQCommand(connection.channel0, Connection.Tune(connection.channelMax, connection.frameMax, connection.writerHeartbeat.toSeconds.toInt))
 
@@ -848,47 +851,46 @@ final class FrameStage()(implicit system: ActorSystem) extends GraphStage[FlowSh
             schedulePeriodically(None, connection.writerHeartbeat)
 
           case Connection.Open(virtualHost, capabilities, insist) =>
-            val vhId = if (virtualHost != null && virtualHost.charAt(0) == '/') {
+            val vid = if (virtualHost != null && virtualHost.charAt(0) == '/') {
               virtualHost.substring(1)
             } else {
               virtualHost
             }
 
-            connection.virtualHost = VirtualHost.getVirtualHost(vhId) match {
-              case Some(x) => x
-              case None    => VirtualHost.createVirtualHost(vhId) // TODO
-            }
+            vhost = vid
 
-            vhost = vhId
-
-            if (connection.virtualHost == null) {
-              pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, "Unknown virtual host: '" + virtualHost + "'", method.classId, method.id)
+            val vhostId = if (vid == "") {
+              VirtualHost.defaultId
             } else {
-              // Check virtualhost access
-              if (!connection.virtualHost.isActive) {
-                //String redirectHost = addressSpace.getRedirectHost(getPort());
-                //if(redirectHost != null) {
-                // sendConnectionClose(0, new AMQFrame(0, new ConnectionRedirectBody(getProtocolVersion(), AMQShortString.valueOf(redirectHost), null)));
-                //} else {
-                //sendConnectionClose(ErrorCodes.CONNECTION_FORCED, "Virtual host '" + addressSpace.getName() + "' is not active", 0);
-                //}
-              } else {
-                try {
-                  if (connection.virtualHost.authoriseCreateConnection(connection)) {
-                    val command = AMQCommand(connection.channel0, Connection.OpenOk(virtualHost))
-
-                    push(out, command.render)
-                    //_state = ConnectionState.OPEN
-                  } else {
-                    pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, "Connection refused", method.classId, method.id)
-                  }
-                } catch {
-                  case e: Throwable =>
-                    log.error(e, e.getMessage)
-                    pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, e.getMessage, method.classId, method.id)
-                }
-              }
+              vid
             }
+
+            val future = (vhostSharding ? VhostEntity.Existed(vhostId)).mapTo[Option[VirtualHost]]
+
+            val callback = getAsyncCallback[Option[VirtualHost]] {
+              case Some(vh @ VirtualHost(_, true)) =>
+                // Check virtualhost access
+                if (vh.authoriseOpenConnection(connection)) {
+                  connection.virtualHost = vh
+                  val command = AMQCommand(connection.channel0, Connection.OpenOk(virtualHost))
+
+                  push(out, command.render)
+                  //_state = ConnectionState.OPEN
+                } else {
+                  pushConnectionClose(channel.id, ErrorCodes.ACCESS_REFUSED, "Connection refused", method.classId, method.id)
+                }
+              case Some(VirtualHost(_, false)) =>
+              //String redirectHost = addressSpace.getRedirectHost(getPort());
+              //if(redirectHost != null) {
+              // sendConnectionClose(0, new AMQFrame(0, new ConnectionRedirectBody(getProtocolVersion(), AMQShortString.valueOf(redirectHost), null)));
+              //} else {
+              //sendConnectionClose(ErrorCodes.CONNECTION_FORCED, "Virtual host '" + addressSpace.getName() + "' is not active", 0);
+              //} 
+              case None =>
+                pushConnectionClose(channel.id, ErrorCodes.NOT_FOUND, s"Unknown virtual host: '$virtualHost'", method.classId, method.id)
+            }
+
+            future.foreach(callback.invoke)
 
           case Connection.Close(replyCode, replyText, classId, methodId) =>
             val future = completeAndCloseAllChannels()

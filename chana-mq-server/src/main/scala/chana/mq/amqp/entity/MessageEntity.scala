@@ -11,8 +11,8 @@ import akka.cluster.sharding.ClusterShardingSettings
 import akka.cluster.sharding.ShardRegion
 import chana.mq.amqp.ActiveCheckTick
 import chana.mq.amqp.Command
-import chana.mq.amqp.Message
 import chana.mq.amqp.model.BasicProperties
+import chana.mq.amqp.model.Message
 import chana.mq.amqp.server.service.ServiceBoard
 import chana.mq.amqp.server.store
 import java.time.LocalDateTime

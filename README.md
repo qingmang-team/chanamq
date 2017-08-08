@@ -8,7 +8,8 @@
 
  * ChanaMQ is still in the alpha phase.
  * Methods/Features are not supported yet:
-   * Virtual host(partically)
+   * Authentication / Access Control
+   * ~~Virtual host~~ (create virtual host via cassandra table vhosts)
    * ~~Native ssl/tls~~
    * Connection.SecureOk / Connection.Blocked / Connection.Unblocked
    * ~~Channel.Flow~~

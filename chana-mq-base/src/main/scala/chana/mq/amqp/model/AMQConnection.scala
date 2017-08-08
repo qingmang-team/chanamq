@@ -18,9 +18,10 @@ final class AMQConnection() {
 
   var virtualHost: VirtualHost = _
 
+  var user: String = _
+
   val channel0 = new AMQChannel(this, 0)
   var channels = Map[Int, AMQChannel]()
-
   def getExistedChannel(channelId: Int): Option[AMQChannel] = {
     if (channelId == 0) {
       Some(channel0)
