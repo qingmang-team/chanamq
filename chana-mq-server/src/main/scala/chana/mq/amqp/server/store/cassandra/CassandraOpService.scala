@@ -353,7 +353,7 @@ final class CassandraOpService(system: ActorSystem) extends store.DBOpService {
   private def _selectVhost(id: String) = selectVhostStmt.bind(id)
   private def _deleteVhost(id: String) = deleteVhostStmt.bind(id)
   private def _insertVhost(id: String, isActive: Boolean) = {
-    val bs = new BoundStatement(insertExchangeStmt)
+    val bs = new BoundStatement(insertVhostStmt)
     bs.setString(0, id)
     bs.setBool(1, isActive)
     bs

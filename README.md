@@ -9,7 +9,7 @@
  * ChanaMQ is still in the alpha phase.
  * Methods/Features are not supported yet:
    * Authentication / Access Control
-   * ~~Virtual host~~ (create virtual host via cassandra table vhosts)
+   * ~~Virtual host~~ 
    * ~~Native ssl/tls~~
    * Connection.SecureOk / Connection.Blocked / Connection.Unblocked
    * ~~Channel.Flow~~
@@ -29,6 +29,21 @@
  * edit application.conf for your configuration
  * cd bin; ./chana-mq-server &
  * To enable persistent feature, you need to install Cassandra and create chanamq space and tables as [create-cassantra.cql](https://github.com/qingmang-team/chanamq/blob/master/chana-mq-server/src/main/resources/create-cassantra.cql)
+
+## Create/Delete Virtual Host 
+ 
+You can change the default admin REST server port via configuration ```chana.mq.amqp.admin.port```. The admin interface is forced to be ```localhost```
+
+### Create virtual host:
+```
+curl localhost:8080/admin/vhost/put/vhostname
+```
+
+### Delete virtual host:
+```
+curl localhost:8080/admin/vhost/delete/vhostname
+```
+
 
 ## High Available
 

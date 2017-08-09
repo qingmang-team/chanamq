@@ -17,7 +17,7 @@ object SimplePublisher {
     //factory.setPassword(password)
     //factory.setVirtualHost(virtualHost)
     //factory.setHost(hostName)
-    factory.setVirtualHost("vhost1")
+    //factory.setVirtualHost("vhost1")
     factory.useSslProtocol()
     factory.setPort(5671)
 

@@ -81,6 +81,11 @@ final class VhostEntity extends Actor with Stash with ActorLogging {
     }
   }
 
+  override def postStop() {
+    log.info(s"$id stopped")
+    super.postStop()
+  }
+
   def receive = initialize
 
   def initialize: Receive = {
@@ -107,6 +112,7 @@ final class VhostEntity extends Actor with Stash with ActorLogging {
     case VhostEntity.Delete(_) =>
       val commander = sender()
 
+      // TODO delete all exchanges/queues/binds under this vhost
       storeService.deleteVhost(id) map { _ =>
         commander ! true
         self ! PoisonPill
