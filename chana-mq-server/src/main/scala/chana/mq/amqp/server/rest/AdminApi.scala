@@ -7,17 +7,15 @@ import akka.pattern.ask
 import akka.http.scaladsl.model.ContentType
 import akka.http.scaladsl.model.HttpCharset
 import akka.http.scaladsl.model.MediaType
-import akka.http.scaladsl.model.StatusCode
 import akka.http.scaladsl.model.StatusCodes
 import akka.http.scaladsl.server.Directives
 import akka.stream.ActorMaterializer
 import akka.util.Timeout
-import chana.mq.amqp.entity.VhostEntity
+import chana.mq.amqp.server.entity.VhostEntity
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.util.Failure
 import scala.util.Success
-import scala.util.Try
 
 trait AdminApi extends Directives {
   val system: ActorSystem

@@ -17,11 +17,11 @@ import akka.util.ByteString
 import chana.mq.amqp.Amqp
 import chana.mq.amqp.ConnectionContext
 import chana.mq.amqp.ServerSettings
-import chana.mq.amqp.entity.ExchangeEntity
-import chana.mq.amqp.entity.MessageEntity
-import chana.mq.amqp.entity.QueueEntity
-import chana.mq.amqp.entity.VhostEntity
 import chana.mq.amqp.server.engine.ServerBluePrint
+import chana.mq.amqp.server.entity.ExchangeEntity
+import chana.mq.amqp.server.entity.MessageEntity
+import chana.mq.amqp.server.entity.QueueEntity
+import chana.mq.amqp.server.entity.VhostEntity
 import chana.mq.amqp.server.rest.AdminApi
 import chana.mq.amqp.server.service.GlobalNodeIdService
 import java.nio.file.Files

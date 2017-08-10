@@ -1,18 +1,19 @@
-package chana.mq.amqp.entity
+package chana.mq.amqp.server.entity
 
 import akka.actor.Actor
 import akka.actor.ActorLogging
 import akka.actor.ActorSystem
-import akka.actor.Cancellable
 import akka.actor.PoisonPill
 import akka.actor.Props
+import akka.actor.Timers
 import akka.cluster.sharding.ClusterSharding
 import akka.cluster.sharding.ClusterShardingSettings
 import akka.cluster.sharding.ShardRegion
-import chana.mq.amqp.ActiveCheckTick
-import chana.mq.amqp.Command
 import chana.mq.amqp.model.BasicProperties
 import chana.mq.amqp.model.Message
+import chana.mq.amqp.server.ActiveCheckTick
+import chana.mq.amqp.server.ActiveCheckTickKey
+import chana.mq.amqp.server.Command
 import chana.mq.amqp.server.service.ServiceBoard
 import chana.mq.amqp.server.store
 import java.time.LocalDateTime
@@ -50,7 +51,8 @@ object MessageEntity {
 
   val Topic = "amqp.message"
 
-  final case object Expired
+  private case object ExpiredTickKey
+  private case object ExpiredTick
 
   final case class Received(id: String, header: Option[BasicProperties], body: Option[Array[Byte]], exchange: String, routing: String, ttl: Option[Long]) extends Command
   final case class Get(id: String) extends Command
@@ -59,7 +61,7 @@ object MessageEntity {
 
 }
 
-final class MessageEntity extends Actor with ActorLogging {
+final class MessageEntity extends Actor with Timers with ActorLogging {
   import MessageEntity._
   import context.dispatcher
 
@@ -75,7 +77,6 @@ final class MessageEntity extends Actor with ActorLogging {
   private var isSavingOrSaved = false
 
   private var lastActiveTime = LocalDateTime.now()
-  private var activeCheckTasks: List[Cancellable] = Nil
 
   private val loading = Promise[Unit]
   private lazy val load: Future[Unit] = {
@@ -103,7 +104,6 @@ final class MessageEntity extends Actor with ActorLogging {
   private lazy val longId = self.path.name.toLong
 
   override def postStop() {
-    activeCheckTasks.foreach(_.cancel)
     log.info(s"$longId stopped")
     super.postStop()
   }
@@ -165,7 +165,7 @@ final class MessageEntity extends Actor with ActorLogging {
         }
       }
 
-    case Expired =>
+    case ExpiredTick =>
       if (isSavingOrSaved) {
         storeService.deleteMessage(longId)
       }
@@ -188,9 +188,12 @@ final class MessageEntity extends Actor with ActorLogging {
 
   private def setTTL(ttl: Option[Long]) {
     log.debug(s"ttl: $ttl")
-    activeCheckTasks = ttl match {
-      case Some(x) => List(context.system.scheduler.schedule(5.minutes, 5.minutes, self, ActiveCheckTick), context.system.scheduler.scheduleOnce(x.millis, self, Expired))
-      case None    => List(context.system.scheduler.schedule(5.minutes, 5.minutes, self, ActiveCheckTick))
+    ttl match {
+      case Some(x) =>
+        timers.startSingleTimer(ExpiredTickKey, ExpiredTick, x.millis)
+        timers.startPeriodicTimer(ActiveCheckTickKey, ActiveCheckTick, 5.minutes)
+      case None =>
+        timers.startPeriodicTimer(ActiveCheckTickKey, ActiveCheckTick, 5.minutes)
     }
   }
 

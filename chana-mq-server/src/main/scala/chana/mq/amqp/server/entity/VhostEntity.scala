@@ -1,4 +1,4 @@
-package chana.mq.amqp.entity
+package chana.mq.amqp.server.entity
 
 import akka.actor.Actor
 import akka.actor.ActorLogging
@@ -9,9 +9,9 @@ import akka.actor.Stash
 import akka.cluster.sharding.ClusterSharding
 import akka.cluster.sharding.ClusterShardingSettings
 import akka.cluster.sharding.ShardRegion
-import chana.mq.amqp.Command
-import chana.mq.amqp.Loaded
 import chana.mq.amqp.model.VirtualHost
+import chana.mq.amqp.server.Command
+import chana.mq.amqp.server.Loaded
 import chana.mq.amqp.server.service.ServiceBoard
 import scala.concurrent.Future
 import scala.util.Failure

@@ -1,4 +1,4 @@
-package chana.mq.amqp.entity
+package chana.mq.amqp.server.entity
 
 import akka.actor.Actor
 import akka.actor.ActorLogging
@@ -14,12 +14,12 @@ import akka.cluster.sharding.ClusterShardingSettings
 import akka.cluster.sharding.ShardRegion
 import akka.pattern.ask
 import akka.util.Timeout
-import chana.mq.amqp.Loaded
-import chana.mq.amqp.VHostCommand
 import chana.mq.amqp.model.Bind
 import chana.mq.amqp.model.Exchange
 import chana.mq.amqp.model.Msg
 import chana.mq.amqp.model.AMQP
+import chana.mq.amqp.server.Loaded
+import chana.mq.amqp.server.VHostCommand
 import chana.mq.amqp.server.engine.DirectMatcher
 import chana.mq.amqp.server.engine.FanoutMatcher
 import chana.mq.amqp.server.engine.QueueMatcher

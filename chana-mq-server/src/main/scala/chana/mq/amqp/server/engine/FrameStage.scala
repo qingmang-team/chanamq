@@ -17,10 +17,6 @@ import akka.util.Timeout
 import chana.mq.amqp
 import chana.mq.amqp.engine.CommandAssembler
 import chana.mq.amqp.engine.FrameParser
-import chana.mq.amqp.entity.ExchangeEntity
-import chana.mq.amqp.entity.MessageEntity
-import chana.mq.amqp.entity.QueueEntity
-import chana.mq.amqp.entity.VhostEntity
 import chana.mq.amqp.method.AMQClass
 import chana.mq.amqp.method.Access
 import chana.mq.amqp.method.Basic
@@ -41,6 +37,10 @@ import chana.mq.amqp.model.LongString
 import chana.mq.amqp.model.Message
 import chana.mq.amqp.model.ProtocolVersion
 import chana.mq.amqp.model.VirtualHost
+import chana.mq.amqp.server.entity.ExchangeEntity
+import chana.mq.amqp.server.entity.MessageEntity
+import chana.mq.amqp.server.entity.QueueEntity
+import chana.mq.amqp.server.entity.VhostEntity
 import chana.mq.amqp.server.service.ServiceBoard
 import java.util.UUID
 import scala.collection.immutable

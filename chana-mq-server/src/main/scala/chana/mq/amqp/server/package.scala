@@ -1,9 +1,9 @@
-package chana.mq
+package chana.mq.amqp
 
 import chana.mq.amqp.model.VirtualHost
 import java.util.concurrent.ThreadLocalRandom
 
-package object amqp {
+package object server {
 
   def nextRandomInt(max: Int) = ThreadLocalRandom.current.nextInt(max + 1)
   def nextRandomInt(min: Int, max: Int) = min + ThreadLocalRandom.current.nextInt(max - min + 1)
@@ -21,6 +21,7 @@ package object amqp {
     }
   }
 
+  private[amqp] case object ActiveCheckTickKey
   private[amqp] case object ActiveCheckTick
   private[amqp] case object Loaded
   private[amqp] case object Unlock
