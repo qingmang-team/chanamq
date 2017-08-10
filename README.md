@@ -36,12 +36,12 @@ You can change the default admin REST server port via configuration ```chana.mq.
 
 ### Create virtual host:
 ```
-curl localhost:8080/admin/vhost/put/vhostname
+curl localhost:15672/admin/vhost/put/vhostname
 ```
 
 ### Delete virtual host:
 ```
-curl localhost:8080/admin/vhost/delete/vhostname
+curl localhost:15672/admin/vhost/delete/vhostname
 ```
 
 
