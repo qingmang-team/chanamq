@@ -13,7 +13,7 @@ import akka.cluster.singleton.ClusterSingletonProxy
 import akka.cluster.singleton.ClusterSingletonProxySettings
 
 object GlobalNodeIdService {
-  def props(): Props = Props(classOf[GlobalNodeIdService])
+  def props(): Props = Props(classOf[GlobalNodeIdService]).withDispatcher("chana-mq-globalidservice-dispatcher")
 
   val name = "nodeIdGenerator"
   val managerName = "chanaSingleton-" + name
@@ -50,7 +50,11 @@ object GlobalNodeIdService {
   final case class AskNodeId(name: String)
 }
 
-class GlobalNodeIdService extends Actor with ActorLogging {
+/**
+ * TODO shall we recover the state such as lastId/nameToId in case of failover?
+ * or, we have better approach.
+ */
+final class GlobalNodeIdService extends Actor with ActorLogging {
   private var lastId = 0
   private var nameToId = Map[String, Int]()
 

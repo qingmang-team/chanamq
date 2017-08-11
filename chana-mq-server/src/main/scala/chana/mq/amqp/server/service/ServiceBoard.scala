@@ -34,14 +34,17 @@ class ServiceBoardExtension(system: ExtendedActorSystem) extends Extension {
 
   def nodeIdService = GlobalNodeIdService.proxy(system)
 
-  lazy val idService = {
+  /**
+   * Ask node id as soon as possible here
+   */
+  val idService = {
     import scala.concurrent.ExecutionContext.Implicits.global
 
-    val f = (nodeIdService ? GlobalNodeIdService.AskNodeId(UUID.randomUUID().toString))(20.seconds).mapTo[Int] map { nodeId =>
+    val f = (nodeIdService ? GlobalNodeIdService.AskNodeId(UUID.randomUUID().toString))(60.seconds).mapTo[Int] map { nodeId =>
       new IdGenerator(nodeId)(system)
     }
 
-    Await.result(f, 20.seconds)
+    Await.result(f, 60.seconds)
   }
 
   lazy val storeService: store.DBOpService = new CassandraOpService(system)
